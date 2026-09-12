@@ -141,34 +141,14 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 ? accountResolver.resolve(auth)
                 : requestContext.getAccountId();
 
-        // Service control policies from the caller's organization, when the Organizations
-        // service is present and SCP enforcement is enabled. Resolved lazily via Instance
-        // to avoid a hard IAM → Organizations dependency.
-        //
-        // Resolved before resolveCallerContext because the account-root branch below needs to
-        // know whether a ceiling exists in order to decide between enforcing and bypassing. That
-        // costs an organization lookup on requests that then bypass; both flags are opt-in, and
-        // effectiveScpLevels returns null immediately when SCP enforcement is off.
-        List<List<String>> scpLevels = scpProvider.isResolvable()
-                ? scpProvider.get().effectiveScpLevels(accountId)
-                : null;
-
-        boolean accountRootPrincipal = false;
-        CallerContext caller = iamService.resolveCallerContext(akid);
-        if (caller == null) {
-            // A bare 12-digit account-id key is floci's account-root principal: not a registered
-            // IAM identity (resolveCallerContext → null), but in AWS the account root is still
-            // bounded by SCPs. Enforce them when the account actually has an SCP ceiling; otherwise
-            // preserve the historical unknown-key bypass.
-            if (scpLevels == null || !akid.equals(accountId)) {
-                return; // unknown access key or no SCP ceiling → bypass (backward-compat)
-            }
-            caller = CallerContext.of(List.of(ROOT_ALLOW_ALL));
-            accountRootPrincipal = true;
+        // Resolved via the shared helper below because the account-root branch there needs to
+        // know whether an SCP ceiling exists in order to decide between enforcing and bypassing;
+        // see resolveEnforcementCaller for the account-root and unknown-key bypass rules.
+        EnforcementCaller enforcementCaller = resolveEnforcementCaller(akid, accountId);
+        if (enforcementCaller == null) {
+            return; // unknown access key or no SCP ceiling → bypass (backward-compat)
         }
-        if (scpLevels != null) {
-            caller = caller.withScpLevels(scpLevels);
-        }
+        CallerContext caller = enforcementCaller.caller();
 
         List<String> resources = arnBuilder.buildResources(credentialScope, ctx, region, accountId);
 
@@ -184,9 +164,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         // root user, so a DenyRootUser guardrail keyed on it must fire against floci's account-root
         // stand-in the same way it enforces SCPs against it (the account-root SCP change above);
         // leaving it absent here would have made the two forms of root enforcement inconsistent.
-        Optional<String> principalArn = accountRootPrincipal
-                ? Optional.of("arn:aws:iam::" + accountId + ":root")
-                : iamService.resolveCallerArn(akid);
+        Optional<String> principalArn = enforcementCaller.principalArn();
         if (principalArn.isPresent()) {
             conditionContext = conditionContext == null ? new HashMap<>() : new HashMap<>(conditionContext);
             conditionContext.put("aws:PrincipalArn", List.of(principalArn.get()));
@@ -215,6 +193,110 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 return;
             }
         }
+    }
+
+    /**
+     * Authorizes a single (action, resource) pair for the caller identified by an
+     * Authorization header, following the same identity resolution and bypass rules
+     * as {@link #filter}. Callers use this for a secondary resource that never appears
+     * in the request URL and so is invisible to {@link ResourceArnBuilder} - such as
+     * the CopyObject/UploadPartCopy source object, which arrives only in the
+     * {@code x-amz-copy-source} header.
+     *
+     * <p>Returns normally when the action is allowed, or when enforcement does not
+     * apply to this request (enforcement disabled, no Authorization header, root or
+     * unknown access key). Throws {@link AwsException} with the same AccessDenied
+     * shape as {@link #filter} when the caller's policies deny the action.
+     */
+    public void authorizeAdditionalResource(String authorizationHeader, String action, String resource) {
+        if (!config.services().iam().enforcementEnabled()) {
+            return;
+        }
+        if (authorizationHeader == null) {
+            return;
+        }
+        String akid = accountResolver.extractAccessKeyId(authorizationHeader);
+        if (akid == null || "test".equals(akid)) {
+            return;
+        }
+        if (extractCredentialScope(authorizationHeader) == null) {
+            return;
+        }
+
+        String accountId = requestContext.getAccountId() == null
+                ? accountResolver.resolve(authorizationHeader)
+                : requestContext.getAccountId();
+
+        EnforcementCaller enforcementCaller = resolveEnforcementCaller(akid, accountId);
+        if (enforcementCaller == null) {
+            return;
+        }
+
+        Map<String, List<String>> conditionContext = null;
+        if (enforcementCaller.principalArn().isPresent()) {
+            conditionContext = new HashMap<>();
+            conditionContext.put("aws:PrincipalArn", List.of(enforcementCaller.principalArn().get()));
+        }
+
+        Decision decision = evaluator.evaluate(enforcementCaller.caller(), null, action, resource, conditionContext);
+        if (decision != Decision.DENY) {
+            return;
+        }
+        LOG.infov("IAM enforcement DENY: akid={0} action={1} resource={2}", akid, action, resource);
+        throw new AwsException("AccessDenied",
+                "User: arn:aws:iam::" + accountId + ":user/" + akid
+                        + " is not authorized to perform: " + action
+                        + " on resource: \"" + resource + "\""
+                        + " because no identity-based policy allows the " + action + " action",
+                403);
+    }
+
+    /**
+     * Resolves the effective caller context (identity policies plus any SCP ceiling) and
+     * principal ARN for {@code akid}, applying the same account-root and unknown-key bypass
+     * rules for both {@link #filter} and {@link #authorizeAdditionalResource}.
+     *
+     * <p>Service control policies come from the caller's organization, when the Organizations
+     * service is present and SCP enforcement is enabled; resolved lazily via Instance to avoid a
+     * hard IAM → Organizations dependency. They are resolved before {@code resolveCallerContext}
+     * because the account-root branch below needs to know whether a ceiling exists in order to
+     * decide between enforcing and bypassing. That costs an organization lookup on requests that
+     * then bypass; both flags are opt-in, and effectiveScpLevels returns null immediately when SCP
+     * enforcement is off.
+     *
+     * <p>A bare 12-digit account-id key is floci's account-root principal: not a registered IAM
+     * identity ({@code resolveCallerContext} → null), but in AWS the account root is still bounded
+     * by SCPs. Enforce them when the account actually has an SCP ceiling; otherwise preserve the
+     * historical unknown-key bypass.
+     *
+     * @return the resolved caller and principal ARN, or {@code null} when the request should
+     *         bypass enforcement (unknown access key with no SCP ceiling)
+     */
+    private EnforcementCaller resolveEnforcementCaller(String akid, String accountId) {
+        List<List<String>> scpLevels = scpProvider.isResolvable()
+                ? scpProvider.get().effectiveScpLevels(accountId)
+                : null;
+
+        boolean accountRootPrincipal = false;
+        CallerContext caller = iamService.resolveCallerContext(akid);
+        if (caller == null) {
+            if (scpLevels == null || !akid.equals(accountId)) {
+                return null;
+            }
+            caller = CallerContext.of(List.of(ROOT_ALLOW_ALL));
+            accountRootPrincipal = true;
+        }
+        if (scpLevels != null) {
+            caller = caller.withScpLevels(scpLevels);
+        }
+
+        Optional<String> principalArn = accountRootPrincipal
+                ? Optional.of("arn:aws:iam::" + accountId + ":root")
+                : iamService.resolveCallerArn(akid);
+        return new EnforcementCaller(caller, principalArn);
+    }
+
+    private record EnforcementCaller(CallerContext caller, Optional<String> principalArn) {
     }
 
     /**
