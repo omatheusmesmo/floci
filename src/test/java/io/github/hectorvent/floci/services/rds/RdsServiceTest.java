@@ -291,6 +291,23 @@ class RdsServiceTest {
     }
 
     @Test
+    void invalidMasterUsernameDoesNotReserveRequestedPort() {
+        assertEquals("InvalidParameterValue", assertThrows(AwsException.class,
+                () -> rdsService.createDbInstance("invalid-user", "postgres", "13",
+                        "1invalid", "secret123", null, "db.t3.micro",
+                        20, false, null, null, null, null, false,
+                        false, null, Map.of(), List.of(), null, "us-east-1",
+                        true, DbInstanceSettings.defaults(), null, 7005)).getErrorCode());
+
+        DbInstance retried = rdsService.createDbInstance("valid-user", "postgres", "13",
+                "admin", "secret123", null, "db.t3.micro",
+                20, false, null, null, null, null, false,
+                false, null, Map.of(), List.of(), null, "us-east-1",
+                true, DbInstanceSettings.defaults(), null, 7005);
+        assertEquals(7005, retried.getProxyPort());
+    }
+
+    @Test
     void createDbInstanceRejectsLegacyBareAuroraEngine() {
         // "aurora" (bare) is the retired Aurora MySQL 5.6 identifier; real AWS no
         // longer accepts it for new instances/clusters and rejects it outright
@@ -3553,6 +3570,42 @@ class RdsServiceTest {
         copy.setStatus("copying");
         assertEquals("InvalidDBClusterSnapshotStateFault", assertThrows(AwsException.class,
                 () -> rdsService.deleteDbClusterSnapshot("csnap-copy")).getErrorCode());
+    }
+
+    @Test
+    void restoreClusterFromSnapshotUsesRequestedPortAndReleasesItOnDelete() {
+        clusterSnapshotOfNewCluster("csnap");
+
+        DbCluster restored = rdsService.restoreDbClusterFromSnapshot("restored-cluster", "csnap",
+                "aurora-postgresql", null, 7005, null, null, null, null, null, null,
+                null, "us-east-1");
+        assertEquals(7005, restored.getEndpoint().port());
+        assertEquals(7005, restored.getProxyPort());
+        assertEquals(7005, rdsService.getDbCluster("restored-cluster").getEndpoint().port());
+        verify(proxyManager).startProxy(any(), any(), anyBoolean(), eq(7005), any(), anyInt(),
+                any(), any(), any(), any(), any(), any());
+
+        assertEquals("InvalidParameterValue", assertThrows(AwsException.class,
+                () -> rdsService.restoreDbClusterFromSnapshot("duplicate-port", "csnap",
+                        "aurora-postgresql", null, 7005, null, null, null, null, null, null,
+                        null, "us-east-1")).getErrorCode());
+
+        DbCluster outsideRange = rdsService.restoreDbClusterFromSnapshot("outside-range", "csnap",
+                "aurora-postgresql", null, 5432, null, null, null, null, null, null,
+                null, "us-east-1");
+        assertNotEquals(5432, outsideRange.getProxyPort());
+        assertTrue(outsideRange.getProxyPort() >= 7000 && outsideRange.getProxyPort() <= 7099);
+        assertNotEquals(restored.getProxyPort(), outsideRange.getProxyPort());
+        assertEquals("InvalidParameterValue", assertThrows(AwsException.class,
+                () -> rdsService.restoreDbClusterFromSnapshot("invalid-port", "csnap",
+                        "aurora-postgresql", null, 1149, null, null, null, null, null, null,
+                        null, "us-east-1")).getErrorCode());
+
+        rdsService.deleteDbCluster("restored-cluster");
+        DbCluster reused = rdsService.restoreDbClusterFromSnapshot("reused-port", "csnap",
+                "aurora-postgresql", null, 7005, null, null, null, null, null, null,
+                null, "us-east-1");
+        assertEquals(7005, reused.getEndpoint().port());
     }
 
     @Test
