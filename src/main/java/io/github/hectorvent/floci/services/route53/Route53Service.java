@@ -614,38 +614,10 @@ public class Route53Service implements Resettable {
             return List.of();
         }
         String normalizedQname = normalizeName(qname).toLowerCase();
-        if (privateZoneNameCounts.isEmpty()
-                || privateZoneNameCounts.keySet().stream().noneMatch(z -> normalizedQname.equals(z) || normalizedQname.endsWith("." + z))) {
-            return List.of();
-        }
-        List<OwnedZone> matchingZones = new ArrayList<>();
-        for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
-            HostedZone zone = owned.zone();
-            if (!zone.isPrivateZone()) {
-                continue;
-            }
-            String zoneName = normalizeName(zone.getName()).toLowerCase();
-            if (normalizedQname.equals(zoneName) || normalizedQname.endsWith("." + zoneName)) {
-                matchingZones.add(owned);
-            }
-        }
-        matchingZones.sort((a, b) -> Integer.compare(
-                normalizeName(b.zone().getName()).length(),
-                normalizeName(a.zone().getName()).length()));
-
-        if (matchingZones.isEmpty()) {
-            return List.of();
-        }
-
-        // Only search the most-specific matching zone(s) to avoid leaking parent zone records
-        int maxZoneLength = normalizeName(matchingZones.get(0).zone().getName()).length();
         List<ResourceRecordSet> nameMatches = new ArrayList<>();
         List<ResourceRecordSet> wildcardMatches = new ArrayList<>();
 
-        for (OwnedZone owned : matchingZones) {
-            if (normalizeName(owned.zone().getName()).length() < maxZoneLength) {
-                break;
-            }
+        for (OwnedZone owned : mostSpecificPrivateZones(normalizedQname)) {
             List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId());
             List<ResourceRecordSet> zoneWildcards = new ArrayList<>();
             for (ResourceRecordSet rrs : records) {
@@ -661,12 +633,11 @@ public class Route53Service implements Resettable {
                     String rName = normalizeName(rrs.getName()).toLowerCase();
                     String wildcardSuffix = rName.substring(2); // e.g. "corp.internal."
                     if (normalizedQname.endsWith("." + wildcardSuffix)) {
-                        // Wildcard cannot match beneath an existing closer name in the same zone (RFC 1034 4.3.3)
+                        // A wildcard cannot match when the name or an ancestor closer than the wildcard's
+                        // parent exists, and a name with records only beneath it exists too (RFC 4592 2.2)
                         boolean closerNameExists = records.stream()
                                 .map(r -> normalizeName(r.getName()).toLowerCase())
-                                .filter(n -> !n.startsWith("*."))
-                                .anyMatch(n -> n.length() > wildcardSuffix.length()
-                                        && (normalizedQname.equals(n) || normalizedQname.endsWith("." + n)));
+                                .anyMatch(n -> sharedSuffixLength(n, normalizedQname) > wildcardSuffix.length());
                         if (!closerNameExists) {
                             wildcardMatches.add(rrs);
                         }
@@ -675,6 +646,70 @@ public class Route53Service implements Resettable {
             }
         }
         return !nameMatches.isEmpty() ? nameMatches : wildcardMatches;
+    }
+
+    /** Length of the longest whole-label suffix two normalized names share, trailing dot included. */
+    private static int sharedSuffixLength(String a, String b) {
+        int i = a.length();
+        int j = b.length();
+        int shared = 0;
+        while (i > 0 && j > 0 && a.charAt(i - 1) == b.charAt(j - 1)) {
+            i--;
+            j--;
+            boolean labelStart = (i == 0 || a.charAt(i - 1) == '.') && (j == 0 || b.charAt(j - 1) == '.');
+            if (labelStart) {
+                shared = a.length() - i;
+            }
+        }
+        return shared;
+    }
+
+    /**
+     * Whether a private zone holds records beneath {@code qname} although none at it: an empty
+     * non-terminal, which exists in DNS and so answers NOERROR rather than NXDOMAIN.
+     */
+    public boolean hasPrivateRecordsBeneath(String qname) {
+        if (qname == null || qname.isBlank()) {
+            return false;
+        }
+        String normalizedQname = normalizeName(qname).toLowerCase();
+        String suffix = "." + normalizedQname;
+        for (OwnedZone owned : mostSpecificPrivateZones(normalizedQname)) {
+            for (ResourceRecordSet rrs : getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId())) {
+                if (normalizeName(rrs.getName()).toLowerCase().endsWith(suffix)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** The private zones with the longest name containing {@code normalizedQname}, so a parent zone never answers for a child. */
+    private List<OwnedZone> mostSpecificPrivateZones(String normalizedQname) {
+        if (privateZoneNameCounts.isEmpty()
+                || privateZoneNameCounts.keySet().stream().noneMatch(z -> normalizedQname.equals(z) || normalizedQname.endsWith("." + z))) {
+            return List.of();
+        }
+        List<OwnedZone> matchingZones = new ArrayList<>();
+        int maxZoneLength = -1;
+        for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
+            HostedZone zone = owned.zone();
+            if (!zone.isPrivateZone()) {
+                continue;
+            }
+            String zoneName = normalizeName(zone.getName()).toLowerCase();
+            if (!normalizedQname.equals(zoneName) && !normalizedQname.endsWith("." + zoneName)) {
+                continue;
+            }
+            if (zoneName.length() > maxZoneLength) {
+                matchingZones.clear();
+                maxZoneLength = zoneName.length();
+            }
+            if (zoneName.length() == maxZoneLength) {
+                matchingZones.add(owned);
+            }
+        }
+        return matchingZones;
     }
 
     private List<ResourceRecordSet> getRecordsForZoneAcrossAccounts(String accountId, String zoneId) {
