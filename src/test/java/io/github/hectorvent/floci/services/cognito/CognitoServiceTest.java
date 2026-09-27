@@ -2431,7 +2431,7 @@ class CognitoServiceTest {
                 Map.of("USERNAME", "bob", "SRP_A", "ABCDEF1234567890"));
         String session = (String) initResult.get("Session");
 
-        clock.advance(Duration.ofMinutes(3).plusSeconds(1));
+        clock.advance(Duration.ofMinutes(client.getAuthSessionValidity()).plusSeconds(1));
 
         AwsException ex = assertThrows(AwsException.class, () ->
                 clockedService.respondToAuthChallenge(client.getClientId(), "PASSWORD_VERIFIER", session,
@@ -2474,6 +2474,34 @@ class CognitoServiceTest {
     }
 
     @Test
+    void srpSessionUsesConfiguredClientValidity() {
+        MutableClock clock = new MutableClock();
+        CognitoService clockedService = serviceWithClock(clock);
+        UserPool pool = clockedService.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        clockedService.adminCreateUser(pool.getId(), "bob", Map.of("email", "bob@example.com"), null);
+        clockedService.adminSetUserPassword(pool.getId(), "bob", "Password123!", true);
+        UserPoolClient client = clockedService.createUserPoolClient(
+                pool.getId(), "c", false, false, List.of(), List.of());
+        client.setAuthSessionValidity(15);
+
+        String session = (String) clockedService.initiateAuth(client.getClientId(), "USER_SRP_AUTH",
+                Map.of("USERNAME", "bob", "SRP_A", "ABCDEF1234567890")).get("Session");
+        Map<String, String> invalidSignature = Map.of("USERNAME", "bob",
+                "PASSWORD_CLAIM_SIGNATURE", "invalid-sig", "TIMESTAMP", "Wed Apr 8 12:00:00 UTC 2026");
+
+        clock.advance(Duration.ofMinutes(4));
+        AwsException beforeExpiry = assertThrows(AwsException.class, () -> clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD_VERIFIER", session, invalidSignature));
+        assertEquals("NotAuthorizedException", beforeExpiry.getErrorCode());
+        assertNotEquals("Invalid session for the user, session is expired.", beforeExpiry.getMessage());
+
+        clock.advance(Duration.ofMinutes(client.getAuthSessionValidity() - 4).plusSeconds(1));
+        AwsException afterExpiry = assertThrows(AwsException.class, () -> clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD_VERIFIER", session, invalidSignature));
+        assertEquals("Invalid session for the user, session is expired.", afterExpiry.getMessage());
+    }
+
+    @Test
     void respondToAuthChallengeAfterUserAuthPasswordSessionExpiryRejects() {
         MutableClock clock = new MutableClock();
         CognitoService clockedService = serviceWithClock(clock);
@@ -2486,13 +2514,69 @@ class CognitoServiceTest {
                 Map.of("USERNAME", "alice", "PREFERRED_CHALLENGE", "PASSWORD"));
         String session = (String) initResult.get("Session");
 
-        clock.advance(Duration.ofMinutes(3).plusSeconds(1));
+        clock.advance(Duration.ofMinutes(client.getAuthSessionValidity()).plusSeconds(1));
 
         AwsException ex = assertThrows(AwsException.class, () ->
                 clockedService.respondToAuthChallenge(client.getClientId(), "PASSWORD", session,
                         Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!")));
         assertEquals("NotAuthorizedException", ex.getErrorCode());
         assertEquals("Invalid session for the user, session is expired.", ex.getMessage());
+    }
+
+    @Test
+    void userAuthSessionKeepsItsOwnValidityWhenAnotherClientPurgesSessions() {
+        MutableClock clock = new MutableClock();
+        CognitoService clockedService = serviceWithClock(clock);
+        UserPool pool = clockedService.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        clockedService.adminCreateUser(pool.getId(), "alice", Map.of(), "Temp1234!");
+        clockedService.adminSetUserPassword(pool.getId(), "alice", "Perm1234!", true);
+        UserPoolClient longClient = openClient(clockedService, pool.getId(), "long", false);
+        longClient.setAuthSessionValidity(10);
+        UserPoolClient shortClient = openClient(clockedService, pool.getId(), "short", false);
+
+        String longSession = (String) clockedService.initiateAuth(longClient.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "alice", "PREFERRED_CHALLENGE", "PASSWORD")).get("Session");
+        clock.advance(Duration.ofMinutes(4));
+        clockedService.initiateAuth(shortClient.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "alice", "PREFERRED_CHALLENGE", "PASSWORD"));
+
+        Map<String, Object> result = clockedService.respondToAuthChallenge(longClient.getClientId(),
+                "PASSWORD", longSession, Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!"));
+        assertNotNull(result.get("AuthenticationResult"));
+
+        String expiringSession = (String) clockedService.initiateAuth(longClient.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "alice", "PREFERRED_CHALLENGE", "PASSWORD")).get("Session");
+        clock.advance(Duration.ofMinutes(longClient.getAuthSessionValidity()).plusSeconds(1));
+        AwsException expired = assertThrows(AwsException.class, () -> clockedService.respondToAuthChallenge(
+                longClient.getClientId(), "PASSWORD", expiringSession,
+                Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!")));
+        assertEquals("Invalid session for the user, session is expired.", expired.getMessage());
+    }
+
+    @Test
+    void simulatedUserAuthSessionUsesConfiguredClientValidity() {
+        MutableClock clock = new MutableClock();
+        CognitoService clockedService = serviceWithClock(clock);
+        UserPool pool = clockedService.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        UserPoolClient client = openClient(clockedService, pool.getId(), "c", false);
+        client.setAuthSessionValidity(10);
+        client.setPreventUserExistenceErrors("ENABLED");
+
+        String liveSession = (String) clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "missing-1")).get("Session");
+        clock.advance(Duration.ofMinutes(4));
+        AwsException live = assertThrows(AwsException.class, () -> clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD", liveSession,
+                Map.of("USERNAME", "missing-1", "PASSWORD", "anything")));
+        assertEquals("Incorrect username or password", live.getMessage());
+
+        String expiredSession = (String) clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "missing-2")).get("Session");
+        clock.advance(Duration.ofMinutes(client.getAuthSessionValidity()).plusSeconds(1));
+        AwsException expired = assertThrows(AwsException.class, () -> clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD", expiredSession,
+                Map.of("USERNAME", "missing-2", "PASSWORD", "anything")));
+        assertEquals("Invalid session for the user, session is expired.", expired.getMessage());
     }
 
     // =========================================================================
@@ -2550,6 +2634,216 @@ class CognitoServiceTest {
                 client.getClientId(), "USER_AUTH",
                 Map.of("USERNAME", "alice", "PREFERRED_CHALLENGE", "EMAIL_OTP")));
         assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    @Test
+    void initiateAuthWithUserAuthHidesAnUnknownUserWhenPreventionIsEnabled() {
+        UserPool pool = service.createUserPool(Map.of(
+                "PoolName", "TestPool",
+                "Policies", Map.of("SignInPolicy", Map.of(
+                        "AllowedFirstAuthFactors", List.of("PASSWORD", "SMS_OTP")))), "us-east-1");
+        UserPoolClient client = openClient(service, pool.getId(), "c", false);
+        service.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("ENABLED");
+
+        Map<String, Object> result = service.initiateAuth(client.getClientId(), "USER_AUTH", Map.of(
+                "USERNAME", "+5511900000000",
+                "PREFERRED_CHALLENGE", "SMS_OTP"));
+
+        String challenge = (String) result.get("ChallengeName");
+        assertTrue(List.of("PASSWORD", "SMS_OTP").contains(challenge),
+                "the simulated challenge must come from the pool's allowed factors: " + challenge);
+        assertEquals(List.of("PASSWORD", "SMS_OTP"), result.get("AvailableChallenges"));
+        String session = (String) result.get("Session");
+        assertNotNull(session);
+
+        Map<String, String> response = "SMS_OTP".equals(challenge)
+                ? Map.of("USERNAME", "+5511900000000", "SMS_OTP_CODE", "123456")
+                : Map.of("USERNAME", "+5511900000000", "PASSWORD", "anything");
+        AwsException exception = assertThrows(AwsException.class, () -> service.respondToAuthChallenge(
+                client.getClientId(), challenge, session, response));
+        assertEquals("NotAuthorizedException", exception.getErrorCode());
+        assertEquals("Incorrect username or password", exception.getMessage());
+    }
+
+    @Test
+    void initiateAuthWithUserAuthDefaultsAnUnknownUserToPasswordWithoutASignInPolicy() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        UserPoolClient client = openClient(service, pool.getId(), "c", false);
+        service.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("ENABLED");
+
+        Map<String, Object> result = service.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "missing"));
+
+        assertEquals("PASSWORD", result.get("ChallengeName"));
+        assertEquals(List.of("PASSWORD"), result.get("AvailableChallenges"));
+    }
+
+    @Test
+    void initiateAuthWithUserAuthKeepsUserNotFoundForLegacyClients() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        UserPoolClient client = openClient(service, pool.getId(), "c", false);
+        service.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("LEGACY");
+
+        AwsException exception = assertThrows(AwsException.class, () -> service.initiateAuth(
+                client.getClientId(), "USER_AUTH", Map.of("USERNAME", "missing")));
+
+        assertEquals("UserNotFoundException", exception.getErrorCode());
+    }
+
+    @Test
+    void respondToAuthChallengeRejectsASimulatedUserSessionAfterExpiry() {
+        MutableClock clock = new MutableClock();
+        CognitoService clockedService = serviceWithClock(clock);
+        UserPool pool = clockedService.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        UserPoolClient client = openClient(clockedService, pool.getId(), "c", false);
+        clockedService.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("ENABLED");
+
+        Map<String, Object> initResult = clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "missing"));
+        String session = (String) initResult.get("Session");
+        clock.advance(Duration.ofMinutes(client.getAuthSessionValidity()).plusSeconds(1));
+
+        AwsException exception = assertThrows(AwsException.class, () -> clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD", session,
+                Map.of("USERNAME", "missing", "PASSWORD", "anything")));
+
+        assertEquals("NotAuthorizedException", exception.getErrorCode());
+        assertEquals("Invalid session for the user, session is expired.", exception.getMessage());
+    }
+
+    @Test
+    void initiateAuthWithUserAuthPurgesExpiredSimulatedSessions() {
+        MutableClock clock = new MutableClock();
+        CognitoService clockedService = serviceWithClock(clock);
+        UserPool pool = clockedService.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        UserPoolClient client = openClient(clockedService, pool.getId(), "c", false);
+        clockedService.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("ENABLED");
+
+        Map<String, Object> oldResult = clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "missing-old"));
+        String oldSession = (String) oldResult.get("Session");
+        clock.advance(Duration.ofMinutes(client.getAuthSessionValidity()).plusSeconds(1));
+
+        Map<String, Object> newResult = clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "missing-new"));
+
+        AwsException oldException = assertThrows(AwsException.class, () -> clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD", oldSession,
+                Map.of("USERNAME", "missing-old", "PASSWORD", "anything")));
+        assertEquals("Session not found", oldException.getMessage());
+
+        String newSession = (String) newResult.get("Session");
+        AwsException newException = assertThrows(AwsException.class, () -> clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD", newSession,
+                Map.of("USERNAME", "missing-new", "PASSWORD", "anything")));
+        assertEquals("Incorrect username or password", newException.getMessage());
+    }
+
+    @Test
+    void initiateAuthWithUserAuthPurgesExpiredSessionsAfterClockRollback() {
+        MutableClock clock = new MutableClock();
+        CognitoService clockedService = serviceWithClock(clock);
+        UserPool pool = clockedService.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        UserPoolClient client = openClient(clockedService, pool.getId(), "c", false);
+        clockedService.adminCreateUser(pool.getId(), "alice", Map.of(), "Temp1234!");
+        clockedService.adminSetUserPassword(pool.getId(), "alice", "Perm1234!", true);
+
+        Map<String, Object> firstResult = clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "alice", "PREFERRED_CHALLENGE", "PASSWORD"));
+        String firstSession = (String) firstResult.get("Session");
+        clock.advance(Duration.ofMinutes(-10));
+
+        Map<String, Object> rolledBackResult = clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "alice", "PREFERRED_CHALLENGE", "PASSWORD"));
+        String rolledBackSession = (String) rolledBackResult.get("Session");
+        clock.advance(Duration.ofMinutes(7));
+
+        clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "alice", "PREFERRED_CHALLENGE", "PASSWORD"));
+
+        AwsException expiredException = assertThrows(AwsException.class, () ->
+                clockedService.respondToAuthChallenge(client.getClientId(), "PASSWORD", rolledBackSession,
+                        Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!")));
+        assertEquals("Session not found", expiredException.getMessage());
+
+        Map<String, Object> authResult = clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD", firstSession,
+                Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!"));
+        assertNotNull(authResult.get("AuthenticationResult"));
+    }
+
+    @Test
+    void initiateAuthWithUserAuthCapsSimulatedSessionsWithoutEvictingRealSessions() {
+        MutableClock clock = new MutableClock();
+        CognitoService clockedService = serviceWithClock(clock);
+        UserPool pool = clockedService.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        UserPoolClient client = openClient(clockedService, pool.getId(), "c", false);
+        clockedService.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("ENABLED");
+        clockedService.adminCreateUser(pool.getId(), "alice", Map.of(), "Temp1234!");
+        clockedService.adminSetUserPassword(pool.getId(), "alice", "Perm1234!", true);
+
+        Map<String, Object> realResult = clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "alice", "PREFERRED_CHALLENGE", "PASSWORD"));
+        String realSession = (String) realResult.get("Session");
+
+        Map<String, Object> firstResult = clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "missing-0"));
+        String firstSession = (String) firstResult.get("Session");
+        for (int index = 1; index < CognitoAuthFlowHandler.MAX_USER_AUTH_SESSIONS_PER_PARTITION; index++) {
+            clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                    Map.of("USERNAME", "missing-" + index));
+        }
+
+        Map<String, Object> newestResult = clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "missing-overflow"));
+
+        AwsException firstException = assertThrows(AwsException.class, () -> clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD", firstSession,
+                Map.of("USERNAME", "missing-0", "PASSWORD", "anything")));
+        assertEquals("Session not found", firstException.getMessage());
+
+        String newestSession = (String) newestResult.get("Session");
+        AwsException newestException = assertThrows(AwsException.class, () -> clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD", newestSession,
+                Map.of("USERNAME", "missing-overflow", "PASSWORD", "anything")));
+        assertEquals("Incorrect username or password", newestException.getMessage());
+
+        Map<String, Object> authResult = clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD", realSession,
+                Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!"));
+        assertNotNull(authResult.get("AuthenticationResult"));
+    }
+
+    @Test
+    void initiateAuthWithUserAuthCapsRealSessionsWithinTheirPartition() {
+        MutableClock clock = new MutableClock();
+        CognitoService clockedService = serviceWithClock(clock);
+        UserPool pool = clockedService.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        UserPoolClient client = openClient(clockedService, pool.getId(), "c", false);
+        clockedService.adminCreateUser(pool.getId(), "alice", Map.of(), "Temp1234!");
+        clockedService.adminSetUserPassword(pool.getId(), "alice", "Perm1234!", true);
+
+        Map<String, Object> firstResult = clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "alice", "PREFERRED_CHALLENGE", "PASSWORD"));
+        String firstSession = (String) firstResult.get("Session");
+        for (int index = 1; index < CognitoAuthFlowHandler.MAX_USER_AUTH_SESSIONS_PER_PARTITION; index++) {
+            clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                    Map.of("USERNAME", "alice", "PREFERRED_CHALLENGE", "PASSWORD"));
+        }
+
+        Map<String, Object> newestResult = clockedService.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "alice", "PREFERRED_CHALLENGE", "PASSWORD"));
+
+        AwsException firstException = assertThrows(AwsException.class, () -> clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD", firstSession,
+                Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!")));
+        assertEquals("Session not found", firstException.getMessage());
+
+        String newestSession = (String) newestResult.get("Session");
+        Map<String, Object> authResult = clockedService.respondToAuthChallenge(
+                client.getClientId(), "PASSWORD", newestSession,
+                Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!"));
+        assertNotNull(authResult.get("AuthenticationResult"));
     }
 
     @Test
