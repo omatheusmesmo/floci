@@ -26,9 +26,11 @@ import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.regex.Pattern;
@@ -256,7 +258,7 @@ public class IamQueryHandler {
     private Response handleCreateUser(MultivaluedMap<String, String> params) {
         String userName = getParam(params, "UserName");
         String path = getParam(params, "Path");
-        Map<String, String> tags = extractTags(params);
+        Map<String, String> tags = extractTags(params, true);
         IamUser user = iamService.createUser(userName, path);
         if (!tags.isEmpty()) iamService.tagUser(userName, tags);
         user = iamService.getUser(userName);
@@ -317,7 +319,7 @@ public class IamQueryHandler {
 
     private Response handleTagUser(MultivaluedMap<String, String> params) {
         String userName = getParam(params, "UserName");
-        iamService.tagUser(userName, extractTags(params));
+        iamService.tagUser(userName, extractTags(params, true));
         return Response.ok(AwsQueryResponse.envelopeNoResult("TagUser", AwsNamespaces.IAM)).build();
     }
 
@@ -402,7 +404,7 @@ public class IamQueryHandler {
     private Response handleCreateSAMLProvider(MultivaluedMap<String, String> params, String authorization) {
         SAMLProvider provider = samlProviderService.create(regionResolver.getPartition(),
                 accountResolver.resolve(authorization), getParam(params, "Name"),
-                getParam(params, "SAMLMetadataDocument"), extractTags(params));
+                getParam(params, "SAMLMetadataDocument"), extractTags(params, false));
         return Response.ok(AwsQueryResponse.envelope("CreateSAMLProvider", AwsNamespaces.IAM,
                 new XmlBuilder().elem("SAMLProviderArn", provider.getArn())
                         .raw(tagsElement(new TreeMap<>(provider.getTags()))).build())).build();
@@ -436,7 +438,7 @@ public class IamQueryHandler {
 
     private Response handleTagSAMLProvider(MultivaluedMap<String, String> params, String authorization) {
         String accountId = accountResolver.resolve(authorization);
-        samlProviderService.tag(accountId, getParam(params, "SAMLProviderArn"), extractTags(params));
+        samlProviderService.tag(accountId, getParam(params, "SAMLProviderArn"), extractTags(params, false));
         return Response.ok(AwsQueryResponse.envelopeNoResult("TagSAMLProvider", AwsNamespaces.IAM)).build();
     }
 
@@ -471,7 +473,7 @@ public class IamQueryHandler {
                 getParam(params, "Url"),
                 getMemberList(params, "ClientIDList"),
                 getMemberList(params, "ThumbprintList"),
-                extractTags(params));
+                extractTags(params, false));
         var xml = new XmlBuilder().elem("OpenIDConnectProviderArn", provider.getArn());
         if (!provider.getTags().isEmpty()) {
             xml.start("Tags").raw(tagsXml(provider.getTags())).end("Tags");
@@ -528,7 +530,7 @@ public class IamQueryHandler {
     }
 
     private Response handleTagOpenIDConnectProvider(MultivaluedMap<String, String> params) {
-        iamService.tagOpenIDConnectProvider(getParam(params, "OpenIDConnectProviderArn"), extractTags(params));
+        iamService.tagOpenIDConnectProvider(getParam(params, "OpenIDConnectProviderArn"), extractTags(params, false));
         return Response.ok(AwsQueryResponse.envelopeNoResult("TagOpenIDConnectProvider", AwsNamespaces.IAM)).build();
     }
 
@@ -779,7 +781,7 @@ public class IamQueryHandler {
         String trustPolicy = getParam(params, "AssumeRolePolicyDocument");
         String description = getParam(params, "Description");
         int maxSession = getIntParam(params, "MaxSessionDuration", 3600);
-        Map<String, String> tags = extractTags(params);
+        Map<String, String> tags = extractTags(params, true);
         IamRole role = iamService.createRole(roleName, path, trustPolicy, description, maxSession, tags);
         String result = new XmlBuilder().start("Role").raw(roleXml(role, true)).end("Role").build();
         return Response.ok(AwsQueryResponse.envelope("CreateRole", AwsNamespaces.IAM, result)).build();
@@ -841,7 +843,7 @@ public class IamQueryHandler {
     }
 
     private Response handleTagRole(MultivaluedMap<String, String> params) {
-        iamService.tagRole(getParam(params, "RoleName"), extractTags(params));
+        iamService.tagRole(getParam(params, "RoleName"), extractTags(params, true));
         return Response.ok(AwsQueryResponse.envelopeNoResult("TagRole", AwsNamespaces.IAM)).build();
     }
 
@@ -866,7 +868,7 @@ public class IamQueryHandler {
         String path = getParam(params, "Path");
         String description = getParam(params, "Description");
         String document = getParam(params, "PolicyDocument");
-        Map<String, String> tags = extractTags(params);
+        Map<String, String> tags = extractTags(params, false);
         IamPolicy policy = iamService.createPolicy(policyName, path, description, document, tags);
         String result = new XmlBuilder().start("Policy").raw(policyXml(policy, true)).end("Policy").build();
         return Response.ok(AwsQueryResponse.envelope("CreatePolicy", AwsNamespaces.IAM, result)).build();
@@ -1113,7 +1115,7 @@ public class IamQueryHandler {
     }
 
     private Response handleTagPolicy(MultivaluedMap<String, String> params) {
-        iamService.tagPolicy(getParam(params, "PolicyArn"), extractTags(params));
+        iamService.tagPolicy(getParam(params, "PolicyArn"), extractTags(params, false));
         return Response.ok(AwsQueryResponse.envelopeNoResult("TagPolicy", AwsNamespaces.IAM)).build();
     }
 
@@ -1381,7 +1383,7 @@ public class IamQueryHandler {
     // =========================================================================
 
     private Response handleCreateInstanceProfile(MultivaluedMap<String, String> params) {
-        Map<String, String> tags = extractTags(params);
+        Map<String, String> tags = extractTags(params, false);
         InstanceProfile profile = iamService.createInstanceProfile(
                 getParam(params, "InstanceProfileName"), getParam(params, "Path"));
         if (!tags.isEmpty()) {
@@ -2160,17 +2162,22 @@ public class IamQueryHandler {
     /**
      * Every IAM request that carries tags types them as {@code tagListType}, whose {@code max: 50}
      * binds the members as sent, so the count is taken here, before the map collapses repeated keys.
+     * Duplicate keys in the request are rejected with InvalidInput (case-insensitively for users and
+     * roles, and case-sensitively for other IAM resource types).
      */
-    private Map<String, String> extractTags(MultivaluedMap<String, String> params) {
+    private Map<String, String> extractTags(MultivaluedMap<String, String> params, boolean caseInsensitiveKeys) {
         List<Map.Entry<String, String>> members = new ArrayList<>();
         for (int i = 1; ; i++) {
             String key = params.getFirst("Tags.member." + i + ".Key");
             String value = params.getFirst("Tags.member." + i + ".Value");
-            if (key == null) break;
+            if (key == null) {
+                break;
+            }
             members.add(Map.entry(key, value != null ? value : ""));
         }
         checkListLength(members.size(), "tags");
-        Map<String, String> tags = new HashMap<>();
+        Set<String> seenKeys = new HashSet<>();
+        Map<String, String> tags = new LinkedHashMap<>();
         for (int i = 0; i < members.size(); i++) {
             String key = members.get(i).getKey();
             String value = members.get(i).getValue();
@@ -2193,6 +2200,19 @@ public class IamQueryHandler {
             if (!TAG_VALUE_PATTERN.matcher(value).matches()) {
                 throw tagValidationError(value, at + ".value",
                         "Member must satisfy regular expression pattern: " + TAG_VALUE_PATTERN.pattern());
+            }
+            if (caseInsensitiveKeys) {
+                for (String seenKey : seenKeys) {
+                    if (seenKey.equalsIgnoreCase(key)) {
+                        throw new AwsException("InvalidInput",
+                                "Duplicate tag keys found. Please note that Tag keys are case insensitive.", 400);
+                    }
+                }
+                seenKeys.add(key);
+            } else {
+                if (!seenKeys.add(key)) {
+                    throw new AwsException("InvalidInput", "Duplicate tag keys found.", 400);
+                }
             }
             tags.put(key, value);
         }
@@ -2303,7 +2323,7 @@ public class IamQueryHandler {
     }
 
     private Response handleTagInstanceProfile(MultivaluedMap<String, String> params) {
-        iamService.tagInstanceProfile(getParam(params, "InstanceProfileName"), extractTags(params));
+        iamService.tagInstanceProfile(getParam(params, "InstanceProfileName"), extractTags(params, false));
         return Response.ok(AwsQueryResponse.envelopeNoResult("TagInstanceProfile", AwsNamespaces.IAM)).build();
     }
 
