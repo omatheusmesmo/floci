@@ -54,9 +54,21 @@ duplicate override IDs.
 
 `ImportRestApi` and `PutRestApi` return parser warnings in the REST API's `warnings` array.
 Set the lowercase query parameter `failonwarnings=true` (SDK: `failOnWarnings`) to reject
-a warning-bearing definition with `BadRequestException` before creating or overwriting
+a warning-bearing definition with `BadRequestException` before creating or changing
 the API. The default is `false`. A successful import with no warnings clears any prior
 warnings; malformed definitions and fatal import errors remain errors in either mode.
+
+`PutRestApi` defaults to `mode=merge`. Merge keeps paths, methods, models, authorizers,
+request validators, and gateway responses omitted from the incoming definition. An incoming
+method replaces the complete existing method at the same path and HTTP verb, including its
+integration and responses. Use `mode=overwrite` to clear those API definitions before import.
+During merge, a method can reference a retained Lambda or Cognito authorizer even when the
+incoming security schemes omit it. A same-name Lambda authorizer keeps its existing URI when
+the incoming definition provides no new URI. If a same-name authorizer changes between Lambda
+and Cognito, retained methods that reference it use the new authorization type. An explicit
+operation-level `security: []` leaves that method without authorization.
+For a same-name Cognito authorizer, merge also keeps its existing pool ARNs when the incoming
+definition provides no new `providerARNs`; an explicit list replaces them, including `[]`.
 
 ### Supported Operations
 

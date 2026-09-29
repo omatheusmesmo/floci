@@ -969,7 +969,8 @@ public class ApiGatewayExecuteController {
                                               Stage stage,
                                               MethodConfig method,
                                               HttpHeaders headers, UriInfo uriInfo, ResolvedApiKey resolvedApiKey) {
-        if ("COGNITO_USER_POOLS".equalsIgnoreCase(method.getAuthorizationType())) {
+        String authorizationType = method.getAuthorizationType();
+        if ("COGNITO_USER_POOLS".equalsIgnoreCase(authorizationType)) {
             CognitoUserPoolAuthorizer.Result result = cognitoAuthorizer.authorize(region, apiId, method, headers);
             if (result.failure() == CognitoUserPoolAuthorizer.Failure.UNAUTHORIZED) {
                 return new AuthorizerResult(gatewayResponse(scope, GatewayResponseType.UNAUTHORIZED, 401,
@@ -981,16 +982,19 @@ public class ApiGatewayExecuteController {
             }
             return new AuthorizerResult(null, result.principalId(), result.context());
         }
-        if ("CUSTOM".equals(method.getAuthorizationType())) {
+        if ("CUSTOM".equals(authorizationType)) {
             String authorizerId = method.getAuthorizerId();
             if (authorizerId == null) {
                 return new AuthorizerResult(null, null, null);
             }
 
             io.github.hectorvent.floci.services.apigateway.model.Authorizer auth = apiGatewayService.getAuthorizer(region, apiId, authorizerId);
+            String authorizerType = auth.getType();
             String lambdaName = functionNameFromUri(auth.getAuthorizerUri());
-            if (lambdaName == null) {
-                return new AuthorizerResult(null, null, null);
+            if ((!"TOKEN".equals(authorizerType) && !"REQUEST".equals(authorizerType))
+                    || lambdaName == null || lambdaName.isBlank()) {
+                return new AuthorizerResult(gatewayResponseOr(Response.status(500).build(), scope,
+                        GatewayResponseType.AUTHORIZER_CONFIGURATION_ERROR, null), null, null);
             }
 
             String event = toAuthorizerEvent(auth, headers, region, apiId, stageName, httpMethod, requestPath, resourcePath, resourceId, stage, uriInfo, resolvedApiKey);
