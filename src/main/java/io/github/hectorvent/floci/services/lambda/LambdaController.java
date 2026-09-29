@@ -123,6 +123,12 @@ public class LambdaController {
             tags.forEach(tagsNode::put);
         }
 
+        Integer reservedConcurrency = fn.getReservedConcurrentExecutions();
+        String effectiveQualifier = LambdaArnUtils.resolveWithQualifier(functionName, qualifier).qualifier();
+        if (effectiveQualifier == null && reservedConcurrency != null) {
+            root.putObject("Concurrency").put("ReservedConcurrentExecutions", reservedConcurrency);
+        }
+
         return Response.ok(root).build();
     }
 
