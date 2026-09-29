@@ -280,6 +280,23 @@ explicit unsupported operations rather than silently resolving to `null`.
 
 ### How a resolver gets called
 
+For a `NONE` data source, no IAM service role is needed. When
+`floci.services.iam.enforcement-enabled` is off (the default), existing DynamoDB, Lambda,
+and RDS resolvers are not blocked by local IAM role checks. When it is on, Floci checks the
+configured `serviceRoleArn` before invoking a backing resource. A valid same-account role ARN
+not present in Floci's IAM store remains permissive, as with STS AssumeRole. A known role must
+belong to the data source's account and partition, trust
+the partition's AppSync service principal (for example, `appsync.amazonaws.com` in commercial
+Regions), and have identity-policy permission for the requested operation and
+resource. An indexed DynamoDB Query or Scan checks the index ARN. RDS execution checks both
+`rds-data:ExecuteStatement` on the cluster and `secretsmanager:GetSecretValue` on the secret.
+Missing roles, missing trust, and insufficient permissions fail the field instead of calling
+the underlying service. IAM condition support here is limited to what Floci's trust and policy
+evaluators implement. `aws:SourceArn` and `aws:SourceAccount` trust conditions are checked for
+the calling API; identity-policy checks include `aws:RequestedRegion` for the resolver invocation.
+Unsupported trust conditions and unmapped DynamoDB operations fail closed. This is not a complete
+emulation of AWS STS AssumeRole credentials.
+
 The GraphQL engine runs in the `floci-sidecar-graphql` container, so the sidecar walks the query and
 Floci owns the resolvers. `POST /v1/execute` carries a `resolve` block naming every coordinate the
 query touches that has a resolver, plus a callback URL and a token minted for that one operation.

@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.appsync.AppSyncService;
 import io.github.hectorvent.floci.services.appsync.graphql.AppSyncVtlEngine;
+import io.github.hectorvent.floci.services.appsync.graphql.datasource.AppSyncDataSourceAuthorizer;
 import io.github.hectorvent.floci.services.appsync.graphql.datasource.AppSyncDataSourceInvoker;
 import io.github.hectorvent.floci.services.appsync.graphql.datasource.AppSyncDataSourceInvokers;
 import io.github.hectorvent.floci.services.appsync.graphql.datasource.LambdaDataSourceInvoker;
@@ -59,8 +60,8 @@ class AppSyncResolverExecutorTest {
     private final RecordingInvoker lambdaInvoker = new RecordingInvoker(DataSourceType.AWS_LAMBDA);
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final AppSyncResolverExecutor executor = new AppSyncResolverExecutor(appSync, jsRuntime,
-            new AppSyncDataSourceInvokers(List.of(invoker, noneInvoker, dynamoDbInvoker, lambdaInvoker)),
-            vtlEngine(), objectMapper);
+            new AppSyncDataSourceInvokers(List.of(invoker, noneInvoker, dynamoDbInvoker, lambdaInvoker),
+                    mock(AppSyncDataSourceAuthorizer.class)), vtlEngine(), objectMapper);
 
     private static AppSyncVtlEngine vtlEngine() {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
@@ -639,7 +640,8 @@ class AppSyncResolverExecutorTest {
                 .thenReturn(new InvokeResult(200, null, "{\"id\":\"42\"}".getBytes(StandardCharsets.UTF_8),
                         null, "request-id"));
         AppSyncResolverExecutor lambdaExecutor = new AppSyncResolverExecutor(appSync, jsRuntime,
-                new AppSyncDataSourceInvokers(List.of(new LambdaDataSourceInvoker(lambdaService, objectMapper))),
+                new AppSyncDataSourceInvokers(List.of(new LambdaDataSourceInvoker(lambdaService, objectMapper)),
+                        mock(AppSyncDataSourceAuthorizer.class)),
                 vtlEngine(), objectMapper);
         Resolver resolver = resolver(ResolverKind.UNIT, "unit-code");
         resolver.setDataSourceName("accountFunction");
@@ -669,7 +671,8 @@ class AppSyncResolverExecutorTest {
                         null, "request-id"));
         AppSyncResolverExecutor lambdaExecutor = new AppSyncResolverExecutor(appSync, jsRuntime,
                 new AppSyncDataSourceInvokers(List.of(
-                        new LambdaDataSourceInvoker(lambdaService, objectMapper))),
+                        new LambdaDataSourceInvoker(lambdaService, objectMapper)),
+                        mock(AppSyncDataSourceAuthorizer.class)),
                 vtlEngine(), objectMapper);
         Resolver resolver = resolver(ResolverKind.UNIT, null);
         resolver.setDataSourceName("accountFunction");
