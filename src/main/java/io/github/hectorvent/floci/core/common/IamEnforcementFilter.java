@@ -423,6 +423,33 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             abortIfDenied(ctx, caller, "s3:GetObject", credentialScope, resources,
                     withoutObjectTags(targetContexts), region, accountId, akid);
         }
+        // A DeleteObject conditioned on an ETag reveals whether the object still has it, and the
+        // conditional-deletes guide requires s3:GetObject for it; If-Match: * (existence only)
+        // needs just s3:DeleteObject. The read is checked the way the PutObject case above is.
+        if ("s3:DeleteObject".equals(action) && isPlainDeleteObject(ctx)
+                && isETagCondition(ctx.getHeaderString("If-Match"))) {
+            abortIfDenied(ctx, caller, "s3:GetObject", credentialScope, resources,
+                    withoutObjectTags(targetContexts), region, accountId, akid);
+        }
+    }
+
+    // The DELETE subresources S3Controller.deleteObject routes away from DeleteObject (?uploadId= is
+    // AbortMultipartUpload, which the action registry also files under s3:DeleteObject). Everything
+    // else, including the x-id and X-Amz-* parameters SDKs and presigned URLs add, is a DeleteObject.
+    private static final Set<String> NON_DELETE_OBJECT_SUBRESOURCES = Set.of("uploadId", "tagging", "annotation");
+
+    private static boolean isPlainDeleteObject(ContainerRequestContext ctx) {
+        return "DELETE".equalsIgnoreCase(ctx.getMethod())
+                && ctx.getUriInfo().getQueryParameters().keySet().stream()
+                        .noneMatch(NON_DELETE_OBJECT_SUBRESOURCES::contains);
+    }
+
+    private static boolean isETagCondition(String ifMatch) {
+        if (ifMatch == null) {
+            return false;
+        }
+        String value = ifMatch.trim();
+        return !value.equals("*") && !value.equals("\"*\"");
     }
 
     /**
