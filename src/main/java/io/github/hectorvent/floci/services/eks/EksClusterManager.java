@@ -1040,7 +1040,7 @@ public class EksClusterManager
         return dockerClient
                 .execStartCmd(execCreate.getId())
                 .exec(logStreamer.execLogCallbackForAccount(
-                        accountId, logGroup, logStream, region, "eks-audit:" + clusterName));
+                        accountId, logGroup, logStream, region, "eks-audit:" + clusterName, false));
     }
 
     Closeable getLogHandle(Cluster cluster) {
