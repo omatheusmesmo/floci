@@ -4377,6 +4377,11 @@ public class Ec2QueryHandler {
                 .elem("availabilityZone", ni.getAvailabilityZone())
                 .elem("description", ni.getDescription())
                 .elem("ownerId", ni.getOwnerId())
+                // AWS emits requesterManaged on every interface, false included -- see the
+                // DescribeNetworkInterfaces sample response -- and requesterId only where
+                // there is a requester. floci leaves requesterId unset; see the field's javadoc.
+                .elem("requesterId", ni.getRequesterId())
+                .elem("requesterManaged", ni.isRequesterManaged())
                 .elem("status", ni.getStatus())
                 .elem("interfaceType", ni.getInterfaceType())
                 .elem("macAddress", ni.getMacAddress())
@@ -5609,6 +5614,19 @@ public class Ec2QueryHandler {
             xml.start("item").elem("groupId", securityGroupId).end("item");
         }
         xml.end("groupSet");
+        // AWS reports an interface endpoint's ENIs here, and the Terraform provider
+        // surfaces them as aws_vpc_endpoint.network_interface_ids. Floci already
+        // synthesizes those interfaces deterministically for flow-log attribution; until
+        // now nothing said so on the wire, so the attribute came back empty and
+        // propagated into every module that feeds it downstream.
+        List<String> endpointEniIds = service.endpointNetworkInterfaceIds(endpoint);
+        if (!endpointEniIds.isEmpty()) {
+            xml.start("networkInterfaceIdSet");
+            for (String eniId : endpointEniIds) {
+                xml.elem("item", eniId);
+            }
+            xml.end("networkInterfaceIdSet");
+        }
         List<VpcEndpointDnsEntry> dnsEntries = service.endpointDnsEntries(endpoint);
         if (!dnsEntries.isEmpty()) {
             xml.start("dnsEntrySet");
