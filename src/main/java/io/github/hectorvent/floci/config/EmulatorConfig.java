@@ -2098,6 +2098,18 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean allowUnsafeHostVolumes();
 
+        /**
+         * When true, Floci removes on startup, in Docker mode, every ECS container a previous run
+         * of <em>this same</em> Floci left on the daemon (matched by the {@code floci_owner_port}
+         * label), task-role credentials proxies included, before the service scheduler starts
+         * replacement tasks. Turn it off when two Floci instances share a daemon with the same
+         * port and no resource namespace, so one does not remove the other's containers.
+         *
+         * Env var: FLOCI_SERVICES_ECS_RECONCILE_CONTAINERS_ON_STARTUP
+         */
+        @WithDefault("true")
+        boolean reconcileContainersOnStartup();
+
         EcsTaskRoleCredentialsConfig taskRoleCredentials();
     }
 
