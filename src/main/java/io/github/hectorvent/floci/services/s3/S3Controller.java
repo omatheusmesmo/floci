@@ -71,6 +71,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.stream.Stream;
 import javax.xml.stream.XMLStreamConstants;
 import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamReader;
@@ -3502,7 +3503,7 @@ public class S3Controller {
                     S3PublicAccessEvaluator.objectArn(s3Service.bucketPartition(bucket), bucket, key));
         }
 
-        if (s3Service.isAuthEnforced()) {
+        if (s3Service.isAuthEnforced() || (config.auth().validateSignatures() && isSignedPost(lcFields))) {
             validatePresignedPostAuth(lcFields, bucket, key, fileData.length);
         } else {
             // Validate policy conditions if present
@@ -3569,6 +3570,17 @@ public class S3Controller {
             throw new AwsException("AuthorizationHeaderMalformed", "The authorization header is malformed; "
                     + "the region '" + region + "' is wrong; expecting a region AWS publishes.", 400);
         }
+    }
+
+    /**
+     * Whether a browser POST carries any SigV4 form field. Under {@code floci.auth.validate-signatures}
+     * such a POST must verify, while one with none of them is anonymous and is left to
+     * {@code enforce-auth}, which decides anonymous access from the bucket policy and ACL.
+     */
+    private static boolean isSignedPost(Map<String, String> fields) {
+        return Stream.of("x-amz-algorithm", "x-amz-credential", "x-amz-signature")
+                .map(fields::get)
+                .anyMatch(value -> value != null && !value.isEmpty());
     }
 
     /**
