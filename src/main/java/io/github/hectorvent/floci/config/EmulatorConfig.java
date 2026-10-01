@@ -1309,6 +1309,9 @@ public interface EmulatorConfig {
 
         @WithDefault("false")
         boolean clearFifoDeduplicationCacheOnPurge();
+
+        @WithDefault("local-emulator-secret")
+        String receiptHandleSecret();
     }
 
     interface S3ServiceConfig {
