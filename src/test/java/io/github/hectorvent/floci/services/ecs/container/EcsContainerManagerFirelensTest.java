@@ -114,6 +114,8 @@ class EcsContainerManagerFirelensTest {
         router.setName("log_router");
         router.setImage("amazon/aws-for-fluent-bit:stable");
         router.setFirelensConfiguration(new FirelensConfiguration("fluentbit", Map.of()));
+        router.setLogConfiguration(new LogConfiguration("awslogs",
+                Map.of("awslogs-group", "/ecs/firelens-family", "awslogs-stream-prefix", "firelens"), null));
 
         ContainerDefinition app = new ContainerDefinition();
         app.setName("app");
@@ -150,6 +152,7 @@ class EcsContainerManagerFirelensTest {
 
         verify(logStreamer).attach(eq("router-id"), anyString(), anyString(), anyString(), anyString());
         verify(logStreamer, never()).attach(eq("app-id"), anyString(), anyString(), anyString(), anyString());
+        verify(logStreamer, never()).attachConsoleOnly(eq("app-id"), anyString());
         assertTrue(handle.getFirelensVolumeName().contains("firelens"));
 
         verify(copyCmd).withRemotePath("/fluent-bit/etc");

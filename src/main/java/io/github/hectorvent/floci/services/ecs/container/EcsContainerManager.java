@@ -509,12 +509,14 @@ public class EcsContainerManager {
                 containerIds.put(def.getName(), dockerId);
 
                 // awsfirelens containers are shipped to Fluent Bit by Docker; don't also scrape json-file.
+                // Only awslogs containers go to CloudWatch Logs; the others stay on the console.
                 if (!awsFirelens) {
-                    String logGroup = "/ecs/" + taskDef.getFamily();
-                    String logStream = logStreamer.generateLogStreamName(def.getName() + "/" + taskId);
-                    Closeable logHandle = logStreamer.attach(
-                            dockerId, logGroup, logStream, region,
-                            "ecs:" + taskDef.getFamily() + ":" + def.getName());
+                    String logPrefix = "ecs:" + taskDef.getFamily() + ":" + def.getName();
+                    AwsLogsDestination awsLogs = awsLogsDestination(def, taskId, dockerId, region);
+                    Closeable logHandle = awsLogs == null
+                            ? logStreamer.attachConsoleOnly(dockerId, logPrefix)
+                            : logStreamer.attach(
+                                    dockerId, awsLogs.group(), awsLogs.stream(), awsLogs.region(), logPrefix);
                     if (logHandle != null) {
                         logStreamsByContainerId.put(dockerId, logHandle);
                     }
@@ -1461,6 +1463,35 @@ public class EcsContainerManager {
     private static boolean isAwsFirelens(ContainerDefinition def) {
         LogConfiguration log = def.getLogConfiguration();
         return log != null && "awsfirelens".equals(log.logDriver());
+    }
+
+    private record AwsLogsDestination(String group, String stream, String region) {}
+
+    /**
+     * Where a container's output goes in CloudWatch Logs. Only the {@code awslogs} driver sends it
+     * there, to its {@code awslogs-group}. The stream is {@code prefix/container-name/task-id}, or the
+     * Docker container ID when {@code awslogs-stream-prefix} is not set, as on AWS. Returns null when
+     * nothing must be sent.
+     */
+    private static AwsLogsDestination awsLogsDestination(
+            ContainerDefinition def, String taskId, String dockerId, String taskRegion) {
+        LogConfiguration log = def.getLogConfiguration();
+        if (log == null || !"awslogs".equals(log.logDriver())) {
+            return null;
+        }
+        Map<String, String> options = log.options() == null ? Map.of() : log.options();
+        String group = options.get("awslogs-group");
+        if (group == null || group.isBlank()) {
+            LOG.warnv("ECS task {0} container {1} uses awslogs without awslogs-group; its logs are not sent to CloudWatch Logs",
+                    taskId, def.getName());
+            return null;
+        }
+        String prefix = options.get("awslogs-stream-prefix");
+        String stream = prefix == null || prefix.isBlank()
+                ? dockerId
+                : prefix + "/" + def.getName() + "/" + taskId;
+        String region = options.get("awslogs-region");
+        return new AwsLogsDestination(group, stream, region == null || region.isBlank() ? taskRegion : region);
     }
 
     private static List<ContainerDefinition> launchOrder(
