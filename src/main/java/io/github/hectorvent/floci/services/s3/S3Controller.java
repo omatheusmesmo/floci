@@ -53,12 +53,15 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -2359,7 +2362,6 @@ public class S3Controller {
             String algorithmHeader = getChecksumAlgorithm(httpHeaders, uriInfo);
             ChecksumAlgorithm algorithm = ChecksumAlgorithm.fromWireValue(algorithmHeader);
             validateChecksumHeaders(httpHeaders, uriInfo, payload, algorithmHeader);
-            validateContentMd5(httpHeaders, payload);
             ObjectAnnotation annotation = s3Service.putObjectAnnotation(bucket, key, annotationName,
                     versionId, payload, httpHeaders.getHeaderString("x-amz-object-if-match"), algorithm);
             Response.ResponseBuilder response = Response.ok(putObjectAnnotationXml(annotation))
@@ -2507,21 +2509,6 @@ public class S3Controller {
     private void appendAnnotationSseHeader(Response.ResponseBuilder response, ObjectAnnotation annotation) {
         if (annotation.getServerSideEncryption() != null) {
             response.header("x-amz-server-side-encryption", annotation.getServerSideEncryption());
-        }
-    }
-
-    private void validateContentMd5(HttpHeaders httpHeaders, byte[] body) {
-        String contentMd5 = httpHeaders.getHeaderString("Content-MD5");
-        if (contentMd5 == null) {
-            return;
-        }
-        try {
-            byte[] digest = java.security.MessageDigest.getInstance("MD5").digest(body);
-            if (!contentMd5.equals(java.util.Base64.getEncoder().encodeToString(digest))) {
-                throw new AwsException("BadDigest", "The Content-MD5 you specified did not match the payload.", 400);
-            }
-        } catch (java.security.NoSuchAlgorithmException e) {
-            throw new IllegalStateException("MD5 algorithm is not available", e);
         }
     }
 
@@ -3057,6 +3044,8 @@ public class S3Controller {
     }
 
     private void validateChecksumHeaders(HttpHeaders httpHeaders, UriInfo uriInfo, byte[] data, String algorithm) {
+        validateContentMd5(httpHeaders.getHeaderString("Content-MD5"), data);
+
         String sha1 = resolveHeaderOrQueryParam(httpHeaders, uriInfo, "x-amz-checksum-sha1");
         if (sha1 != null && !sha1.equals(S3Checksum.sha1Base64(data))) {
             throw new AwsException("BadDigest", "The SHA1 checksum you specified did not match the payload.", 400);
@@ -3080,6 +3069,32 @@ public class S3Controller {
         String crc64nvme = resolveHeaderOrQueryParam(httpHeaders, uriInfo, "x-amz-checksum-crc64nvme");
         if (crc64nvme != null && !crc64nvme.equals(S3Checksum.crc64NvmeBase64(data))) {
             throw new AwsException("BadDigest", "The CRC64NVME checksum you specified did not match the payload.", 400);
+        }
+    }
+
+    // S3 answers InvalidDigest for a Content-MD5 that is not the base64 of a 16-byte digest, and
+    // BadDigest for a well-formed one that does not match the payload.
+    private static void validateContentMd5(String contentMd5, byte[] data) {
+        if (contentMd5 == null) {
+            return;
+        }
+        byte[] expected;
+        try {
+            expected = Base64.getDecoder().decode(contentMd5.trim());
+        } catch (IllegalArgumentException e) {
+            expected = null;
+        }
+        if (expected == null || expected.length != 16) {
+            throw new AwsException("InvalidDigest", "The Content-MD5 you specified is not valid.", 400);
+        }
+        byte[] actual;
+        try {
+            actual = MessageDigest.getInstance("MD5").digest(data);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("MD5 algorithm is not available", e);
+        }
+        if (!MessageDigest.isEqual(expected, actual)) {
+            throw new AwsException("BadDigest", "The Content-MD5 you specified did not match what we received.", 400);
         }
     }
 
@@ -3593,7 +3608,7 @@ public class S3Controller {
 
     private void validatePolicyExpiration(String policyBase64) {
         try {
-            byte[] decoded = java.util.Base64.getDecoder().decode(policyBase64);
+            byte[] decoded = Base64.getDecoder().decode(policyBase64);
             JsonNode policy = OBJECT_MAPPER.readTree(decoded);
             JsonNode expirationNode = policy.get("expiration");
             if (expirationNode == null || expirationNode.isNull()) {
@@ -3616,7 +3631,7 @@ public class S3Controller {
     private void validatePolicyConditions(String policyBase64, String bucket,
                                            Map<String, String> fields, int contentLength) {
         try {
-            byte[] decoded = java.util.Base64.getDecoder().decode(policyBase64);
+            byte[] decoded = Base64.getDecoder().decode(policyBase64);
             JsonNode policy = OBJECT_MAPPER.readTree(decoded);
             JsonNode conditions = policy.get("conditions");
             if (conditions == null || !conditions.isArray()) {
