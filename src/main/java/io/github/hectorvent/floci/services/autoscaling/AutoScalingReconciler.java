@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import io.github.hectorvent.floci.services.autoscaling.model.ScalingActivity;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.Ec2UserDataDecoder;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
@@ -592,7 +593,8 @@ public class AutoScalingReconciler {
                     version.getData().getKeyName(),
                     version.getData().effectiveSecurityGroupIds(),
                     version.getData().getInstanceTags(),
-                    version.getData().getUserData(),
+                    Ec2UserDataDecoder.decodeIfMissing(
+                            version.getData().getUserData(), version.getData().getEncodedUserData()),
                     ec2Service.iamInstanceProfileArn(version.getData()),
                     asg.getLaunchTemplateId(),
                     asg.getLaunchTemplateName(),
@@ -622,7 +624,8 @@ public class AutoScalingReconciler {
                         version.getData().getKeyName(),
                         version.getData().effectiveSecurityGroupIds(),
                         version.getData().getInstanceTags(),
-                        version.getData().getUserData(),
+                        Ec2UserDataDecoder.decodeIfMissing(
+                                version.getData().getUserData(), version.getData().getEncodedUserData()),
                         ec2Service.iamInstanceProfileArn(version.getData()),
                         specification.getLaunchTemplateId() == null
                                 ? mixedLaunchTemplate.getLaunchTemplateId()
