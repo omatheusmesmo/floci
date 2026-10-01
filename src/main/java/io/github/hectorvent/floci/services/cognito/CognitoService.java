@@ -437,6 +437,21 @@ public class CognitoService implements ResourceProvider {
         pool.setPolicies(normalized);
     }
 
+    /**
+     * Gives a pool without a {@code SignInPolicy} AWS's default, {@code PASSWORD} alone. DescribeUserPool on
+     * AWS reports {@code {"AllowedFirstAuthFactors": ["PASSWORD"]}} for a pool created without one, on any
+     * tier. Unlike {@link #normalizePasswordPolicy}, defaulting this one enforces nothing new: a pool with no
+     * sign-in policy already offers only password challenges.
+     */
+    private static void defaultSignInPolicy(UserPool pool) {
+        Map<String, Object> policies = pool.getPolicies() == null ? new HashMap<>() : new HashMap<>(pool.getPolicies());
+        if (policies.get("SignInPolicy") instanceof Map<?, ?>) {
+            return;
+        }
+        policies.put("SignInPolicy", Map.of("AllowedFirstAuthFactors", List.of("PASSWORD")));
+        pool.setPolicies(policies);
+    }
+
     private void validatePasswordPolicy(Map<String, Object> passwordPolicy) {
         Object minLengthVal = passwordPolicy.get("MinimumLength");
         if (minLengthVal == null) {
@@ -537,6 +552,7 @@ public class CognitoService implements ResourceProvider {
             pool.setPolicies((Map<String, Object>) request.get("Policies"));
             normalizePasswordPolicy(pool);
         }
+        defaultSignInPolicy(pool);
         if (request.containsKey("DeletionProtection")) pool.setDeletionProtection((String) request.get("DeletionProtection"));
         if (request.containsKey("LambdaConfig")) pool.setLambdaConfig((Map<String, Object>) request.get("LambdaConfig"));
         if (request.containsKey("Schema")) pool.setSchemaAttributes(prefixCustomSchemaAttributes((List<Map<String, Object>>) request.get("Schema")));
@@ -2940,6 +2956,22 @@ public class CognitoService implements ResourceProvider {
     CognitoUser authenticateManagedLogin(UserPoolClient client, String username, String password) {
         return authFlowHandler.authenticateManagedLogin(describeUserPool(client.getUserPoolId()), client,
                 username, password);
+    }
+
+    /** Managed login's choice-based sign-in; see {@link CognitoAuthFlowHandler#managedLoginFirstFactors}. */
+    List<String> managedLoginFirstFactors(UserPoolClient client) {
+        return authFlowHandler.managedLoginFirstFactors(describeUserPool(client.getUserPoolId()), client);
+    }
+
+    /** See {@link CognitoAuthFlowHandler#startManagedLoginEmailOtp}. */
+    String startManagedLoginEmailOtp(UserPoolClient client, String username) {
+        return authFlowHandler.startManagedLoginEmailOtp(describeUserPool(client.getUserPoolId()), client, username);
+    }
+
+    /** See {@link CognitoAuthFlowHandler#completeManagedLoginEmailOtp}. */
+    CognitoUser completeManagedLoginEmailOtp(UserPoolClient client, String session, String code) {
+        return authFlowHandler.completeManagedLoginEmailOtp(describeUserPool(client.getUserPoolId()), client,
+                session, code);
     }
 
     public Map<String, Object> respondToAuthChallenge(String clientId, String challengeName,
