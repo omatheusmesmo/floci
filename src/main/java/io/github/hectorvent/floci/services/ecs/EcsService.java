@@ -3978,20 +3978,11 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         if (cluster == null) {
             return 0;
         }
-        Stream<EcsTask> running = tasks.values().stream()
-                .filter(t -> ownedBy(t, svc, cluster))
-                .filter(t -> TaskStatus.RUNNING.name().equals(t.getLastStatus()));
-
-        // reconcileDaemonService does not replace a DAEMON service's tasks when its task
-        // definition changes, so the stale ones are the only ones there will ever be; counting
-        // them keeps main's behaviour. Scope this like REPLICA once DAEMON services roll.
-        if (SCHEDULING_DAEMON.equals(svc.getSchedulingStrategy())) {
-            return running.count();
-        }
-
         String currentDeploymentId = deploymentId(svc);
         String taskDefinitionArn = resolvedTaskDefinitionArn(svc, serviceRegion(svc));
-        return running
+        return tasks.values().stream()
+                .filter(t -> ownedBy(t, svc, cluster))
+                .filter(t -> TaskStatus.RUNNING.name().equals(t.getLastStatus()))
                 .filter(t -> !isStaleForDeployment(t, currentDeploymentId, taskDefinitionArn))
                 .count();
     }
@@ -4508,14 +4499,20 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 .map(ContainerInstance::getContainerInstanceArn)
                 .collect(Collectors.toSet());
 
+        String currentDeploymentId = deploymentId(svc);
+        String currentTaskDefinitionArn = pinnedTaskDefinitionArn(svc, key, region);
+
         // Every task that still occupies its instance: RUNNING, PENDING (Docker start in
         // flight) and STOPPING (teardown in flight, possibly stranded). Only STOPPED frees the
         // slot — otherwise a stranded STOPPING task would get a duplicate next to it.
-        // RUNNING tasks are preferred as the instance's daemon when there are several.
+        // RUNNING tasks are preferred as the instance's daemon when there are several, and
+        // among those the ones on the current deployment.
         List<EcsTask> liveTasks = tasks.values().stream()
                 .filter(t -> ownedBy(t, svc, cluster))
                 .filter(t -> !TaskStatus.STOPPED.name().equals(t.getLastStatus()))
-                .sorted(Comparator.comparingInt(t -> daemonTaskRank(t.getLastStatus())))
+                .sorted(Comparator.<EcsTask>comparingInt(t -> daemonTaskRank(t.getLastStatus()))
+                        .thenComparing(t -> isStaleForDeployment(t, currentDeploymentId,
+                                currentTaskDefinitionArn) ? 1 : 0))
                 .toList();
 
         Set<String> covered = new HashSet<>();
@@ -4523,6 +4520,23 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         for (EcsTask t : liveTasks) {
             String instanceArn = t.getContainerInstanceArn();
             boolean keep = instanceArn != null && activeArns.contains(instanceArn) && covered.add(instanceArn);
+            if (keep && isStaleForDeployment(t, currentDeploymentId, currentTaskDefinitionArn)) {
+                // maximumPercent is 100 for DAEMON: the replacement starts once this is STOPPED.
+                if (!TaskStatus.STOPPING.name().equals(t.getLastStatus())) {
+                    try {
+                        stopTask(clusterName, t.getTaskArn(),
+                                "Service deployment replaced task definition " + t.getTaskDefinitionArn(),
+                                STOP_CODE_SERVICE_SCHEDULER_INITIATED, region);
+                    } catch (Exception e) {
+                        LOG.warnv("Service reconciler failed to stop daemon task {0}: {1}",
+                                t.getTaskArn(), e.getMessage());
+                    }
+                }
+                if (TaskStatus.STOPPED.name().equals(t.getLastStatus())) {
+                    covered.remove(instanceArn);
+                }
+                continue;
+            }
             if (keep) {
                 if (TaskStatus.RUNNING.name().equals(t.getLastStatus())) {
                     running++;
