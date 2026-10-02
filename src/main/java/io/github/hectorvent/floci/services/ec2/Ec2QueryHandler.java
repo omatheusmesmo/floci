@@ -282,6 +282,7 @@ public class Ec2QueryHandler {
                 case "DisableIpamOrganizationAdminAccount" -> handleDisableIpamOrgAdmin(params);
                 case "CreateIpam" -> handleCreateIpam(params, region);
                 case "DescribeIpams" -> handleDescribeIpams(params, region);
+                case "DescribeIpamScopes" -> handleDescribeIpamScopes(params, region);
                 case "DeleteIpam" -> handleDeleteIpam(params, region);
                 case "ModifyIpam" -> handleModifyIpam(params, region);
                 case "CreateIpamPool" -> handleCreateIpamPool(params, region);
@@ -1815,6 +1816,35 @@ public class Ec2QueryHandler {
         return xmlResponse(xml.build());
     }
 
+    private Response handleDescribeIpamScopes(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        List<String> ids = getList(p, "IpamScopeId");
+        if (ids.isEmpty()) {
+            ids = getList(p, "IpamScopeIds.member");
+        }
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeIpamScopesResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("ipamScopeSet");
+        Map<String, Long> poolCounts = ipamService.poolCountsByScope();
+        for (Ec2IpamService.ScopeOfIpam s : ipamService.describeIpamScopes(region, ids)) {
+            IpamScope scope = s.scope();
+            xml.start("item")
+                    .elem("ownerId", s.ipam().getOwnerId())
+                    .elem("ipamScopeId", scope.getIpamScopeId())
+                    .elem("ipamScopeArn", scope.getIpamScopeArn())
+                    .elem("ipamArn", s.ipam().getIpamArn())
+                    .elem("ipamRegion", s.ipam().getRegion())
+                    .elem("ipamScopeType", scope.getScopeType())
+                    .elem("isDefault", String.valueOf(scope.isDefault()))
+                    .elem("poolCount", String.valueOf(poolCounts.getOrDefault(scope.getIpamScopeId(), 0L)))
+                    .elem("state", scope.getState())
+                    .end("item");
+        }
+        xml.end("ipamScopeSet").end("DescribeIpamScopesResponse");
+        return xmlResponse(xml.build());
+    }
+
     private Response handleDeleteIpam(MultivaluedMap<String, String> p, String region) {
         checkDryRun(p);
         Ipam ipam = ipamService.deleteIpam(region, p.getFirst("IpamId"));
@@ -2080,6 +2110,11 @@ public class Ec2QueryHandler {
                 .elem("addressFamily", pool.getAddressFamily())
                 .elem("state", pool.getState())
                 .elem("autoImport", String.valueOf(pool.isAutoImport()));
+        ipamService.findScope(pool.getIpamScopeId()).ifPresent(s -> xml
+                .elem("ipamScopeArn", s.scope().getIpamScopeArn())
+                .elem("ipamScopeType", s.scope().getScopeType())
+                .elem("ipamArn", s.ipam().getIpamArn())
+                .elem("ipamRegion", s.ipam().getRegion()));
         if (pool.getSourceIpamPoolId() != null) {
             xml.elem("sourceIpamPoolId", pool.getSourceIpamPoolId());
         }
