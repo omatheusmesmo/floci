@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplate
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -342,6 +343,30 @@ class ApiGatewayRestApiCfnProvisionerTest {
 
         assertEquals("auth-1", r.getPhysicalId());
         assertEquals("auth-1", r.getAttributes().get("AuthorizerId"));
+    }
+
+    /**
+     * A COGNITO_USER_POOLS authorizer with no provider ARNs rejects every token, so dropping the
+     * property turns a correct template into a 401 on every request.
+     */
+    @Test
+    void authorizerForwardsProviderArns() throws Exception {
+        Authorizer authorizer = new Authorizer();
+        authorizer.setId("auth-1");
+        when(api.createAuthorizer(eq("us-east-1"), eq("api-1"), anyMap())).thenReturn(authorizer);
+
+        StackResource r = resource("AWS::ApiGateway::Authorizer", "Auth");
+        provisioner.provision(r, props("""
+                {"RestApiId": "api-1", "Name": "cognito", "Type": "COGNITO_USER_POOLS",
+                 "IdentitySource": "method.request.header.Authorization",
+                 "ProviderARNs": ["arn:aws:cognito-idp:us-east-1:000000000000:userpool/us-east-1_abc"]}
+                """), ctx());
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, Object>> request = ArgumentCaptor.forClass(Map.class);
+        verify(api).createAuthorizer(eq("us-east-1"), eq("api-1"), request.capture());
+        assertEquals(List.of("arn:aws:cognito-idp:us-east-1:000000000000:userpool/us-east-1_abc"),
+                request.getValue().get("providerARNs"));
     }
 
     @Test

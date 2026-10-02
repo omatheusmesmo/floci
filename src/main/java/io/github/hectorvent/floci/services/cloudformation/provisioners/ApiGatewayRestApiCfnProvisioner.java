@@ -513,6 +513,9 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
         if (ttl != null) {
             req.put("authorizerResultTtlInSeconds", ttl);
         }
+        if (props != null && props.has("ProviderARNs")) {
+            req.put("providerARNs", ctx.resolveStringList(props, "ProviderARNs"));
+        }
         Authorizer authorizer = apiGatewayService.createAuthorizer(ctx.region(), apiId, req);
         r.setPhysicalId(authorizer.getId());
         r.getAttributes().put("AuthorizerId", authorizer.getId());
