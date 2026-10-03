@@ -1165,6 +1165,15 @@ public class LambdaService implements ResourceProvider {
      */
     public InvokeResult invoke(String region, String functionName, String queryQualifier, byte[] payload,
                                InvocationType type) {
+        return invoke(region, functionName, queryQualifier, payload, type, null);
+    }
+
+    /**
+     * Invokes a function, handing {@code clientContext} (the decoded {@code X-Amz-Client-Context} JSON) to a
+     * synchronous invocation. AWS passes it to synchronous invocations only.
+     */
+    public InvokeResult invoke(String region, String functionName, String queryQualifier, byte[] payload,
+                               InvocationType type, String clientContext) {
         validateInvokeQualifier(queryQualifier);
         LambdaArnUtils.ResolvedFunctionRef ref = resolveWithRegion(region, functionName, queryQualifier);
         String name = ref.name();
@@ -1178,7 +1187,7 @@ public class LambdaService implements ResourceProvider {
         }
         reportCustomResourceLiveness(payload);
         InvokeResult result = executorService.invoke(fn, payload, type,
-                LambdaInvocationChain.currentDepth(), qualifier);
+                LambdaInvocationChain.currentDepth(), qualifier, clientContext);
         result.setExecutedVersion(fn.getVersion());
         return result;
     }
