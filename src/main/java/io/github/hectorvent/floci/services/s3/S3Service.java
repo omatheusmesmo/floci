@@ -10,6 +10,9 @@ import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -73,14 +76,14 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import io.github.hectorvent.floci.core.resource.ExplorerResource;
-import io.github.hectorvent.floci.core.resource.ResourceProvider;
-import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 
 @ApplicationScoped
 public class S3Service implements Resettable, ResourceProvider {
@@ -93,7 +96,7 @@ public class S3Service implements Resettable, ResourceProvider {
         }
         return "000000000000";
     }
-    private static final String DEFAULT_OWNER_DISPLAY_NAME = "floci";
+    static final String DEFAULT_OWNER_DISPLAY_NAME = "floci";
     private static final String AUTHENTICATED_USERS_GROUP_URI = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
     private static final String LOG_DELIVERY_GROUP_URI = "http://acs.amazonaws.com/groups/s3/LogDelivery";
     private static final String LEGACY_ACCESS_KEY_ID = "test";
@@ -136,6 +139,65 @@ public class S3Service implements Resettable, ResourceProvider {
     // map that would need reference counting to ever shrink safely.
     private static final int DISK_FILE_LOCK_STRIPES = 256;
     private final ReentrantLock[] diskFileLocks = newLockStripes(DISK_FILE_LOCK_STRIPES);
+    // Bucket deletion must not sweep an upload while a multipart operation is creating or using it.
+    // Read locks preserve parallel multipart writes; fair, fixed stripes avoid writer starvation
+    // and retaining a lock for every bucket name ever seen.
+    private final ReentrantReadWriteLock[] multipartBucketLocks = newMultipartBucketLocks(256);
+    // A second, finer-grained lock prevents part writes, completion and abort from racing on
+    // the same upload without serializing independent uploads in the bucket.
+    private final ReentrantLock[] multipartUploadLocks = newLockStripes(256);
+
+    private static ReentrantReadWriteLock[] newMultipartBucketLocks(int count) {
+        ReentrantReadWriteLock[] locks = new ReentrantReadWriteLock[count];
+        for (int i = 0; i < count; i++) {
+            locks[i] = new ReentrantReadWriteLock(true);
+        }
+        return locks;
+    }
+
+    private ReentrantReadWriteLock multipartBucketLock(String bucketName) {
+        return multipartBucketLocks[Math.floorMod(bucketName.hashCode(), multipartBucketLocks.length)];
+    }
+
+    private static <T> T withLock(Lock lock, Supplier<T> operation) {
+        lock.lock();
+        try {
+            return operation.get();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static void withLock(Lock lock, Runnable operation) {
+        withLock(lock, () -> {
+            operation.run();
+            return null;
+        });
+    }
+
+    private <T> T withMultipartBucketReadLock(String bucketName, Supplier<T> operation) {
+        return withLock(multipartBucketLock(bucketName).readLock(), operation);
+    }
+
+    private void withMultipartBucketReadLock(String bucketName, Runnable operation) {
+        withLock(multipartBucketLock(bucketName).readLock(), operation);
+    }
+
+    private void withMultipartBucketWriteLock(String bucketName, Runnable operation) {
+        withLock(multipartBucketLock(bucketName).writeLock(), operation);
+    }
+
+    private ReentrantLock multipartUploadLock(String uploadId) {
+        return multipartUploadLocks[Math.floorMod(uploadId.hashCode(), multipartUploadLocks.length)];
+    }
+
+    private <T> T withMultipartOperationLock(String bucketName, String uploadId, Supplier<T> operation) {
+        return withMultipartBucketReadLock(bucketName, () -> withLock(multipartUploadLock(uploadId), operation));
+    }
+
+    private void withMultipartOperationLock(String bucketName, String uploadId, Runnable operation) {
+        withMultipartBucketReadLock(bucketName, () -> withLock(multipartUploadLock(uploadId), operation));
+    }
 
     private static ReentrantLock[] newLockStripes(int count) {
         ReentrantLock[] locks = new ReentrantLock[count];
@@ -374,17 +436,19 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     public void deleteBucket(String bucketName) {
-        ensureBucketExists(bucketName);
-        Bucket bucket = bucketStore.get(bucketName)
-                .orElseThrow(() -> new AwsException("NoSuchBucket",
-                        "The specified bucket does not exist.", 404));
+        withMultipartBucketWriteLock(bucketName, () -> {
+            ensureBucketExists(bucketName);
+            Bucket bucket = bucketStore.get(bucketName)
+                    .orElseThrow(() -> new AwsException("NoSuchBucket",
+                            "The specified bucket does not exist.", 404));
 
-        // Takes the bucket monitor that the bucket-scoped mutations take: a mutation that read the
-        // record before the delete would otherwise write it back afterwards, restoring the bucket.
-        synchronized (bucket) {
-            deleteBucketLocked(bucketName);
-        }
-        LOG.infov("Deleted bucket: {0}", bucketName);
+            // Multipart operations take the stripe before the bucket monitor, so a delete cannot
+            // sweep their temporary parts or miss an upload created just after its scan.
+            synchronized (bucket) {
+                deleteBucketLocked(bucketName);
+            }
+            LOG.infov("Deleted bucket: {0}", bucketName);
+        });
     }
 
     private void deleteBucketLocked(String bucketName) {
@@ -393,6 +457,14 @@ public class S3Service implements Resettable, ResourceProvider {
         if (!objects.isEmpty()) {
             throw new AwsException("BucketNotEmpty",
                     "The bucket you tried to delete is not empty.", 409);
+        }
+
+        // Outstanding uploads belong to this bucket incarnation. Do not let a later
+        // owner of the same name discover or complete them.
+        for (MultipartUpload upload : multipartUploads.values()) {
+            if (bucketName.equals(upload.getBucket()) && ownerId().equals(upload.getOwnerAccountId())) {
+                cleanupMultipart(upload.getUploadId());
+            }
         }
 
         bucketStore.delete(bucketName);
@@ -411,6 +483,12 @@ public class S3Service implements Resettable, ResourceProvider {
 
     public List<Bucket> listBuckets() {
         return bucketStore.scan(key -> true);
+    }
+
+    public String getBucketOwnerAccountId(String bucketName) {
+        return resolveBucketEntry(bucketName)
+                .map(AccountAwareStorageBackend.OwnedEntry::account)
+                .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
     }
 
     public void putBucketLogging(String bucketName, String loggingConfigurationXml) {
@@ -3351,51 +3429,55 @@ public class S3Service implements Resettable, ResourceProvider {
                                                    String sseCustomerAlgorithm, String sseCustomerKey, String sseCustomerKeyMd5,
                                                    String checksumAlgorithm, String checksumType,
                                                    Map<String, String> tagging) {
-        ensureBucketExists(bucket);
-        if (acl != null && !acl.isBlank()) {
-            cannedObjectAclXml(acl);
-        }
-        String normalizedServerSideEncryption = normalizeServerSideEncryption(serverSideEncryption);
-        SseCustomerKey customerKey = validateSseCustomerKey(sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
-        rejectConflictingServerSideEncryption(normalizedServerSideEncryption, customerKey);
-        MultipartUpload upload = new MultipartUpload(bucket, key, contentType);
-        if (metadata != null) {
-            upload.getMetadata().putAll(metadata);
-        }
-        upload.setStorageClass(ObjectAttributeName.normalizeStorageClass(storageClass));
-        upload.setContentDisposition(contentDisposition);
-        upload.setServerSideEncryption(normalizedServerSideEncryption);
-        upload.setSseKmsKeyId("aws:kms".equals(normalizedServerSideEncryption) ? sseKmsKeyId : null);
-        if (customerKey != null) {
-            upload.setSseCustomerAlgorithm(customerKey.algorithm());
-            upload.setSseCustomerKeyMd5(customerKey.keyMd5());
-        }
-        upload.setAcl(acl);
-        ChecksumAlgorithm algorithm = ChecksumAlgorithm.fromWireValue(checksumAlgorithm);
-        ChecksumType requestedChecksumType = ChecksumType.fromWireValue(checksumType);
-        if (requestedChecksumType != null && algorithm == null) {
-            throw new AwsException("InvalidRequest",
-                    "The x-amz-checksum-type header can only be used with the x-amz-checksum-algorithm header.", 400);
-        }
-        upload.setChecksumAlgorithm(algorithm);
-        upload.setChecksumType(algorithm == null ? null : algorithm.multipartType(requestedChecksumType));
-        if (tagging != null && !tagging.isEmpty()) {
-            upload.setTagging(new HashMap<>(tagging));
-        }
-
-        if (inMemory) {
-            memoryMultipartStore.put(upload.getUploadId(), new ConcurrentHashMap<>());
-        } else {
-            try {
-                Files.createDirectories(dataRoot.resolve(".multipart").resolve(upload.getUploadId()));
-            } catch (IOException e) {
-                throw new UncheckedIOException("Failed to create multipart temp directory", e);
+        return withMultipartBucketReadLock(bucket, () -> {
+            ensureBucketExists(bucket);
+            if (acl != null && !acl.isBlank()) {
+                cannedObjectAclXml(acl);
             }
-        }
+            String normalizedServerSideEncryption = normalizeServerSideEncryption(serverSideEncryption);
+            SseCustomerKey customerKey = validateSseCustomerKey(sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
+            rejectConflictingServerSideEncryption(normalizedServerSideEncryption, customerKey);
+            MultipartUpload upload = new MultipartUpload(bucket, key, contentType);
+            upload.setOwnerAccountId(getBucketOwnerAccountId(bucket));
+            upload.setInitiatorAccountId(ownerId());
+            if (metadata != null) {
+                upload.getMetadata().putAll(metadata);
+            }
+            upload.setStorageClass(ObjectAttributeName.normalizeStorageClass(storageClass));
+            upload.setContentDisposition(contentDisposition);
+            upload.setServerSideEncryption(normalizedServerSideEncryption);
+            upload.setSseKmsKeyId("aws:kms".equals(normalizedServerSideEncryption) ? sseKmsKeyId : null);
+            if (customerKey != null) {
+                upload.setSseCustomerAlgorithm(customerKey.algorithm());
+                upload.setSseCustomerKeyMd5(customerKey.keyMd5());
+            }
+            upload.setAcl(acl);
+            ChecksumAlgorithm algorithm = ChecksumAlgorithm.fromWireValue(checksumAlgorithm);
+            ChecksumType requestedChecksumType = ChecksumType.fromWireValue(checksumType);
+            if (requestedChecksumType != null && algorithm == null) {
+                throw new AwsException("InvalidRequest",
+                        "The x-amz-checksum-type header can only be used with the x-amz-checksum-algorithm header.", 400);
+            }
+            upload.setChecksumAlgorithm(algorithm);
+            upload.setChecksumType(algorithm == null ? null : algorithm.multipartType(requestedChecksumType));
+            if (tagging != null && !tagging.isEmpty()) {
+                upload.setTagging(new HashMap<>(tagging));
+            }
 
-        multipartUploads.put(upload.getUploadId(), upload);
-        LOG.infov("Initiated multipart upload: {0}/{1}, uploadId={2}", bucket, key, upload.getUploadId());
-        return upload;
+            if (inMemory) {
+                memoryMultipartStore.put(upload.getUploadId(), new ConcurrentHashMap<>());
+            } else {
+                try {
+                    Files.createDirectories(dataRoot.resolve(".multipart").resolve(upload.getUploadId()));
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to create multipart temp directory", e);
+                }
+            }
+
+            multipartUploads.put(upload.getUploadId(), upload);
+            LOG.infov("Initiated multipart upload: {0}/{1}, uploadId={2}", bucket, key, upload.getUploadId());
+            return upload;
+        });
     }
 
     public String uploadPart(String bucket, String key, String uploadId, int partNumber, byte[] data) {
@@ -3411,34 +3493,32 @@ public class S3Service implements Resettable, ResourceProvider {
     /** Stores one part and returns it, with the ETag and the checksum the upload's algorithm gives it. */
     public Part storePart(String bucket, String key, String uploadId, int partNumber, byte[] data,
                           String sseCustomerAlgorithm, String sseCustomerKey, String sseCustomerKeyMd5) {
-        MultipartUpload upload = multipartUploads.get(uploadId);
-        if (upload == null || !upload.getBucket().equals(bucket) || !upload.getKey().equals(key)) {
-            throw new AwsException("NoSuchUpload",
-                    "The specified multipart upload does not exist.", 404);
-        }
-        if (partNumber < 1 || partNumber > 10000) {
-            throw new AwsException("InvalidArgument",
-                    "Part number must be between 1 and 10000.", 400);
-        }
-        validateSseCustomerAccess(upload, sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
-
-        if (inMemory) {
-            memoryMultipartStore.get(uploadId).put(partNumber, data);
-        } else {
-            Path partPath = dataRoot.resolve(".multipart").resolve(uploadId).resolve(String.valueOf(partNumber));
-            try {
-                Files.write(partPath, data);
-            } catch (IOException e) {
-                throw new UncheckedIOException("Failed to write multipart part", e);
+        return withMultipartOperationLock(bucket, uploadId, () -> {
+            MultipartUpload upload = getMultipartUpload(bucket, key, uploadId);
+            if (partNumber < 1 || partNumber > 10000) {
+                throw new AwsException("InvalidArgument",
+                        "Part number must be between 1 and 10000.", 400);
             }
-        }
+            validateSseCustomerAccess(upload, sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
 
-        String eTag = computeETag(data);
-        Part part = new Part(partNumber, eTag, data.length);
-        part.setChecksum(S3Checksum.of(upload.getChecksumAlgorithm(), data));
-        upload.getParts().put(partNumber, part);
-        LOG.debugv("Uploaded part {0} for upload {1} ({2} bytes)", partNumber, uploadId, data.length);
-        return part;
+            if (inMemory) {
+                memoryMultipartStore.get(uploadId).put(partNumber, data);
+            } else {
+                Path partPath = dataRoot.resolve(".multipart").resolve(uploadId).resolve(String.valueOf(partNumber));
+                try {
+                    Files.write(partPath, data);
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to write multipart part", e);
+                }
+            }
+
+            String eTag = computeETag(data);
+            Part part = new Part(partNumber, eTag, data.length);
+            part.setChecksum(S3Checksum.of(upload.getChecksumAlgorithm(), data));
+            upload.getParts().put(partNumber, part);
+            LOG.debugv("Uploaded part {0} for upload {1} ({2} bytes)", partNumber, uploadId, data.length);
+            return part;
+        });
     }
 
     public String uploadPartCopy(String destBucket, String destKey, String uploadId, int partNumber,
@@ -3504,92 +3584,91 @@ public class S3Service implements Resettable, ResourceProvider {
     public S3Object completeMultipartUpload(String bucket, String key, String uploadId, List<Integer> partNumbers,
                                             Map<Integer, String> partETags, Map<Integer, S3Checksum> partChecksums,
                                             String checksumType, S3Checksum expectedChecksum) {
-        MultipartUpload upload = multipartUploads.get(uploadId);
-        if (upload == null || !upload.getBucket().equals(bucket) || !upload.getKey().equals(key)) {
-            throw new AwsException("NoSuchUpload",
-                    "The specified multipart upload does not exist.", 404);
-        }
+        S3Object completed = withMultipartOperationLock(bucket, uploadId, () -> {
+            MultipartUpload upload = getMultipartUpload(bucket, key, uploadId);
 
-        ChecksumAlgorithm algorithm = upload.getChecksumAlgorithm() != null ? upload.getChecksumAlgorithm() : ChecksumAlgorithm.CRC64NVME;
-        ChecksumType storedChecksumType = upload.getChecksumType() != null ? upload.getChecksumType() : ChecksumType.FULL_OBJECT;
+            ChecksumAlgorithm algorithm = upload.getChecksumAlgorithm() != null ? upload.getChecksumAlgorithm() : ChecksumAlgorithm.CRC64NVME;
+            ChecksumType storedChecksumType = upload.getChecksumType() != null ? upload.getChecksumType() : ChecksumType.FULL_OBJECT;
 
-        int previousPartNumber = 0;
-        for (int num : partNumbers) {
-            if (num <= previousPartNumber) {
-                throw new AwsException("InvalidPartOrder",
-                        "The list of parts was not in ascending order.", 400);
-            }
-            previousPartNumber = num;
-            Part part = upload.getParts().get(num);
-            if (part == null) {
-                throw new AwsException("InvalidPart",
-                        "One or more of the specified parts could not be found. Part " + num + " is missing.", 400);
-            }
-            if (!partETags.isEmpty() && !etagsMatch(part.getETag(), partETags.get(num))) {
-                throw new AwsException("InvalidPart",
-                        "One or more of the specified parts could not be found. Part " + num
-                                + " has an invalid ETag.", 400);
-            }
-            validatePartChecksum(upload.getChecksumAlgorithm(), storedChecksumType, num, part, partChecksums.get(num));
-        }
-
-        validateCompleteChecksumType(algorithm, storedChecksumType, ChecksumType.fromWireValue(checksumType));
-
-        // Concatenate parts in order
-        try {
-            MessageDigest md = MessageDigest.getInstance("MD5");
+            int previousPartNumber = 0;
             for (int num : partNumbers) {
-                // A part ETag is the MD5 of that part, so the composite hashes it without rehashing the data
-                String partETag = stripSurroundingQuotes(upload.getParts().get(num).getETag());
-                md.update(HexFormat.of().parseHex(partETag));
+                if (num <= previousPartNumber) {
+                    throw new AwsException("InvalidPartOrder",
+                            "The list of parts was not in ascending order.", 400);
+                }
+                previousPartNumber = num;
+                Part part = upload.getParts().get(num);
+                if (part == null) {
+                    throw new AwsException("InvalidPart",
+                            "One or more of the specified parts could not be found. Part " + num + " is missing.", 400);
+                }
+                if (!partETags.isEmpty() && !etagsMatch(part.getETag(), partETags.get(num))) {
+                    throw new AwsException("InvalidPart",
+                            "One or more of the specified parts could not be found. Part " + num
+                                    + " has an invalid ETag.", 400);
+                }
+                validatePartChecksum(upload.getChecksumAlgorithm(), storedChecksumType, num, part, partChecksums.get(num));
             }
 
-            // Composite ETag: MD5 of concatenated part MD5s, suffixed with part count
-            String compositeETag = "\"" + bytesToHex(md.digest()) + "-" + partNumbers.size() + "\"";
+            validateCompleteChecksumType(algorithm, storedChecksumType, ChecksumType.fromWireValue(checksumType));
 
-            byte[] allData = concatenateParts(uploadId, partNumbers);
+            // Concatenate parts in order
+            try {
+                MessageDigest md = MessageDigest.getInstance("MD5");
+                for (int num : partNumbers) {
+                    // A part ETag is the MD5 of that part, so the composite hashes it without rehashing the data
+                    String partETag = stripSurroundingQuotes(upload.getParts().get(num).getETag());
+                    md.update(HexFormat.of().parseHex(partETag));
+                }
 
-            List<Part> completedParts = partNumbers.stream()
-                    .map(num -> copyPart(upload.getParts().get(num)))
-                    .toList();
-            S3Checksum checksum = storedChecksumType == ChecksumType.COMPOSITE
-                    ? S3Checksum.composite(algorithm, completedParts.stream()
-                            .map(part -> part.getChecksum().valueFor(algorithm)).toList())
-                    : S3Checksum.fullObject(algorithm, allData);
-            if (expectedChecksum != null && expectedChecksum.hasAnyValue()) {
-                validateExpectedChecksum(checksum, expectedChecksum);
+                // Composite ETag: MD5 of concatenated part MD5s, suffixed with part count
+                String compositeETag = "\"" + bytesToHex(md.digest()) + "-" + partNumbers.size() + "\"";
+
+                byte[] allData = concatenateParts(uploadId, partNumbers);
+
+                List<Part> completedParts = partNumbers.stream()
+                        .map(num -> copyPart(upload.getParts().get(num)))
+                        .toList();
+                S3Checksum checksum = storedChecksumType == ChecksumType.COMPOSITE
+                        ? S3Checksum.composite(algorithm, completedParts.stream()
+                                .map(part -> part.getChecksum().valueFor(algorithm)).toList())
+                        : S3Checksum.fullObject(algorithm, allData);
+                if (expectedChecksum != null && expectedChecksum.hasAnyValue()) {
+                    validateExpectedChecksum(checksum, expectedChecksum);
+                }
+                S3Object object = storeObject(bucket, key, allData, upload.getContentType(), upload.getMetadata(),
+                        checksum, completedParts,
+                        new PutObjectOptions()
+                                .withStorageClass(upload.getStorageClass())
+                                .withContentDisposition(upload.getContentDisposition())
+                                .withServerSideEncryption(upload.getServerSideEncryption())
+                                .withSseKmsKeyId(upload.getSseKmsKeyId())
+                                .withAcl(upload.getAcl())
+                                .withTagging(upload.getTagging()),
+                        compositeETag);
+                if (upload.getSseCustomerAlgorithm() != null) {
+                    object.setSseCustomerAlgorithm(upload.getSseCustomerAlgorithm());
+                    object.setSseCustomerKeyMd5(upload.getSseCustomerKeyMd5());
+                }
+                String bucketOwnerAccount = resolveBucketEntry(bucket)
+                        .map(AccountAwareStorageBackend.OwnedEntry::account)
+                        .orElseThrow(() -> new AwsException("NoSuchBucket",
+                                "The specified bucket does not exist.", 404));
+                putObjectMetadataForAccount(bucketOwnerAccount, bucket, key, object);
+
+                // Cleanup
+                cleanupMultipart(uploadId);
+                LOG.infov("Completed multipart upload: {0}/{1}, uploadId={2}, parts={3}",
+                        bucket, key, uploadId, partNumbers.size());
+                return object;
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to read multipart parts", e);
+            } catch (NoSuchAlgorithmException e) {
+                throw new RuntimeException("MD5 algorithm not available", e);
             }
-            S3Object object = storeObject(bucket, key, allData, upload.getContentType(), upload.getMetadata(),
-                    checksum, completedParts,
-                    new PutObjectOptions()
-                            .withStorageClass(upload.getStorageClass())
-                            .withContentDisposition(upload.getContentDisposition())
-                            .withServerSideEncryption(upload.getServerSideEncryption())
-                            .withSseKmsKeyId(upload.getSseKmsKeyId())
-                            .withAcl(upload.getAcl())
-                            .withTagging(upload.getTagging()),
-                    compositeETag);
-            if (upload.getSseCustomerAlgorithm() != null) {
-                object.setSseCustomerAlgorithm(upload.getSseCustomerAlgorithm());
-                object.setSseCustomerKeyMd5(upload.getSseCustomerKeyMd5());
-            }
-            String bucketOwnerAccount = resolveBucketEntry(bucket)
-                    .map(AccountAwareStorageBackend.OwnedEntry::account)
-                    .orElseThrow(() -> new AwsException("NoSuchBucket",
-                            "The specified bucket does not exist.", 404));
-            putObjectMetadataForAccount(bucketOwnerAccount, bucket, key, object);
-
-            // Cleanup
-            cleanupMultipart(uploadId);
-            LOG.infov("Completed multipart upload: {0}/{1}, uploadId={2}, parts={3}",
-                    bucket, key, uploadId, partNumbers.size());
-            fireNotifications(bucket, key, "ObjectCreated:CompleteMultipartUpload", object);
-            return object;
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to read multipart parts", e);
-        } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException("MD5 algorithm not available", e);
-        }
+        });
+        fireNotifications(bucket, key, "ObjectCreated:CompleteMultipartUpload", completed);
+        return completed;
     }
 
     /**
@@ -3656,19 +3735,19 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     public void abortMultipartUpload(String bucket, String key, String uploadId) {
-        MultipartUpload upload = multipartUploads.get(uploadId);
-        if (upload == null || !upload.getBucket().equals(bucket) || !upload.getKey().equals(key)) {
-            throw new AwsException("NoSuchUpload",
-                    "The specified multipart upload does not exist.", 404);
-        }
-        cleanupMultipart(uploadId);
-        LOG.infov("Aborted multipart upload: {0}/{1}, uploadId={2}", bucket, key, uploadId);
+        withMultipartOperationLock(bucket, uploadId, () -> {
+            getMultipartUpload(bucket, key, uploadId);
+            cleanupMultipart(uploadId);
+            LOG.infov("Aborted multipart upload: {0}/{1}, uploadId={2}", bucket, key, uploadId);
+        });
     }
 
     public List<MultipartUpload> listMultipartUploads(String bucket) {
         ensureBucketExists(bucket);
+        String ownerAccountId = getBucketOwnerAccountId(bucket);
         return multipartUploads.values().stream()
-                .filter(u -> u.getBucket().equals(bucket))
+                .filter(u -> u.getBucket().equals(bucket)
+                        && (u.getOwnerAccountId() == null || ownerAccountId.equals(u.getOwnerAccountId())))
                 .toList();
     }
 
@@ -3678,7 +3757,9 @@ public class S3Service implements Resettable, ResourceProvider {
 
     public MultipartUpload getMultipartUpload(String bucket, String key, String uploadId) {
         MultipartUpload upload = multipartUploads.get(uploadId);
-        if (upload == null || !upload.getBucket().equals(bucket) || !upload.getKey().equals(key)) {
+        if (upload == null || !upload.getBucket().equals(bucket) || !upload.getKey().equals(key)
+                || (upload.getOwnerAccountId() != null
+                        && !upload.getOwnerAccountId().equals(getBucketOwnerAccountId(bucket)))) {
             throw new AwsException("NoSuchUpload",
                     "The specified multipart upload does not exist.", 404);
         }
