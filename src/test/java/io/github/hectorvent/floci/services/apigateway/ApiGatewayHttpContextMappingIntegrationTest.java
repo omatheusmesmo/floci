@@ -10,7 +10,6 @@ import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
-import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -34,6 +33,7 @@ import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @QuarkusTest
@@ -223,6 +223,7 @@ class ApiGatewayHttpContextMappingIntegrationTest {
             assertNotEquals(previousRequestId, requestId);
             previousRequestId = requestId;
         }
+        verify(lambdaService).invoke(eq("us-east-1"), eq(FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse));
     }
 
     @ParameterizedTest
@@ -231,13 +232,10 @@ class ApiGatewayHttpContextMappingIntegrationTest {
         configureAuthorizer(0);
         configureIntegration(type, "GET");
         deploy();
-        for (String token : List.of("", "Bearer forged")) {
-            RequestSpecification request = given().header("X-User-Claims", "forged");
-            if (!token.isEmpty()) {
-                request.header("Authorization", token);
-            }
-            request.get("/execute-api/" + apiId + "/test/orders/42").then().statusCode(403);
-        }
+        given().header("X-User-Claims", "forged")
+                .get("/execute-api/" + apiId + "/test/orders/42").then().statusCode(401);
+        given().header("X-User-Claims", "forged").header("Authorization", "Bearer forged")
+                .get("/execute-api/" + apiId + "/test/orders/42").then().statusCode(403);
         assertEquals(0, backendRequests.get());
     }
 
@@ -277,7 +275,7 @@ class ApiGatewayHttpContextMappingIntegrationTest {
 
     private void configureAuthorizer(int ttl) throws Exception {
         configureAuthorizer(ttl, Map.of("userClaims", "verified-claims", "principalId", "forged-principal",
-                "numberKey", 123, "booleanKey", true, "objectKey", Map.of("nested", "value")));
+                "numberKey", 123, "booleanKey", true));
     }
 
     private void configureAuthorizer(int ttl, Map<String, Object> context) throws Exception {
@@ -308,7 +306,7 @@ class ApiGatewayHttpContextMappingIntegrationTest {
         parameters.put("integration.request.header.X-Number", "context.authorizer.numberKey");
         parameters.put("integration.request.header.X-Boolean", "context.authorizer.booleanKey");
         parameters.put("integration.request.header.X-Missing", "context.authorizer.missing");
-        parameters.put("integration.request.header.X-Object", "context.authorizer.objectKey");
+        parameters.put("integration.request.header.X-Object", "context.identity");
         parameters.put("integration.request.header.X-Request-Id", "context.requestId");
         parameters.put("integration.request.header.X-Context-Stage", "context.stage");
         parameters.put("integration.request.header.X-Context-Path", "context.path");
