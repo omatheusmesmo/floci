@@ -1261,6 +1261,10 @@ public class S3Controller {
                 .header("Access-Control-Allow-Origin", cors.allowedOrigin())
                 .header("Access-Control-Allow-Methods", String.join(", ", cors.allowedMethods()));
 
+        if (!"*".equals(cors.allowedOrigin())) {
+            builder.header("Access-Control-Allow-Credentials", "true");
+        }
+
         if (cors.maxAgeSeconds() > 0) {
             builder.header("Access-Control-Max-Age", cors.maxAgeSeconds());
         }
