@@ -127,7 +127,10 @@ class RdsParameterGroupCopyResetIntegrationTest {
             .statusCode(200)
             .body(containsString("<ParameterName>max_connections</ParameterName>"))
             .body(containsString("<ParameterValue>250</ParameterValue>"))
-            .body(containsString("<ParameterName>log_min_duration_statement</ParameterName>"));
+            .body(containsString("<ParameterName>log_min_duration_statement</ParameterName>"))
+            .body(containsString("<Parameter><ParameterName>max_connections</ParameterName>"
+                    + "<ParameterValue>250</ParameterValue><Source>user</Source><IsModifiable>true</IsModifiable>"
+                    + "<ApplyMethod>immediate</ApplyMethod></Parameter>"));
 
         query("ListTagsForResource")
                 .formParam("ResourceName", "arn:aws:rds:us-east-1:000000000000:pg:" + TARGET_PG)
@@ -212,7 +215,9 @@ class RdsParameterGroupCopyResetIntegrationTest {
         .then()
             .statusCode(200)
             .body(not(containsString("<ParameterName>max_connections</ParameterName>")))
-            .body(containsString("<ParameterName>log_min_duration_statement</ParameterName>"));
+            .body(containsString("<Parameter><ParameterName>log_min_duration_statement</ParameterName>"
+                    + "<ParameterValue>500</ParameterValue><Source>user</Source><IsModifiable>true</IsModifiable>"
+                    + "<ApplyMethod>immediate</ApplyMethod></Parameter>"));
 
         query("ResetDBParameterGroup")
                 .formParam("DBParameterGroupName", TARGET_PG)
@@ -226,7 +231,9 @@ class RdsParameterGroupCopyResetIntegrationTest {
         .when().post("/")
         .then()
             .statusCode(200)
-            .body(not(containsString("<ParameterName>")));
+            .body(not(containsString("<ParameterName>")))
+            .body(not(containsString("<Source>")))
+            .body(not(containsString("<ApplyMethod>")));
 
         query("ResetDBParameterGroup")
                 .formParam("DBParameterGroupName", TARGET_PG)
@@ -276,7 +283,10 @@ class RdsParameterGroupCopyResetIntegrationTest {
         .when().post("/")
         .then()
             .statusCode(200)
-            .body(containsString("<ParameterName>rds.force_ssl</ParameterName>"));
+            .body(containsString("<ParameterName>rds.force_ssl</ParameterName>"))
+            .body(containsString("<Parameter><ParameterName>rds.force_ssl</ParameterName>"
+                    + "<ParameterValue>1</ParameterValue><Source>user</Source><IsModifiable>true</IsModifiable>"
+                    + "<ApplyMethod>immediate</ApplyMethod></Parameter>"));
 
         // A managed default group cannot be copied. AWS refuses it through the identifier rule,
         // since default group names carry periods; the reference says to create a custom group
@@ -310,7 +320,8 @@ class RdsParameterGroupCopyResetIntegrationTest {
         .when().post("/")
         .then()
             .statusCode(200)
-            .body(not(containsString("<ParameterName>rds.force_ssl</ParameterName>")));
+            .body(not(containsString("<ParameterName>rds.force_ssl</ParameterName>")))
+            .body(not(containsString("<Source>")));
 
         query("ResetDBClusterParameterGroup")
                 .formParam("DBClusterParameterGroupName", "default.aurora-postgresql15")

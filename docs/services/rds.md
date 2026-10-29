@@ -676,7 +676,10 @@ apply. Every version is `available`, so `IncludeAll` changes nothing.
 
 `DescribeEngineDefaultParameters` and `DescribeEngineDefaultClusterParameters` accept a family from the
 catalogue (`InvalidParameterValue` otherwise) and return an empty parameter list, consistent with
-`DescribeDBParameters` on a default group, which lists only values set on the group.
+`DescribeDBParameters` on a default group, which lists only values set on the group. The two describe
+actions report each listed parameter with `Source=user` and the `ApplyMethod` it was modified with,
+defaulting to `immediate` when the modify sent none, and a `Source` of `system` or `engine-default`
+lists nothing, since the family defaults are not modeled.
 `DescribeValidDBInstanceModifications` reports the instance's storage type and the sizes `ModifyDBInstance`
 stores as asked: the current size, and from the smallest real increase up to the engine's maximum (16384
 GiB for SQL Server, 65536 GiB otherwise). Storage only grows, and for PostgreSQL, MySQL and MariaDB an

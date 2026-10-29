@@ -5050,6 +5050,66 @@ class RdsServiceTest {
     }
 
     @Test
+    void parameterGroupApplyMethodsSurviveCopyAndDropOnReset() {
+        rdsService.createDbParameterGroup("apply-methods-source-pg", "postgres16", "source");
+        rdsService.modifyDbParameterGroup(
+                "apply-methods-source-pg", Map.of("max_connections", "250"),
+                Map.of("max_connections", "pending-reboot"), "us-east-1");
+        rdsService.modifyDbParameterGroup(
+                "apply-methods-source-pg", Map.of("work_mem", "65536"),
+                Map.of("work_mem", "immediate"), "us-east-1");
+
+        DbParameterGroup source = rdsService.getDbParameterGroup("apply-methods-source-pg");
+        assertEquals("pending-reboot", source.getApplyMethods().get("max_connections"));
+        assertEquals("immediate", source.getApplyMethods().get("work_mem"));
+
+        DbParameterGroup copy = rdsService.copyDbParameterGroup(
+                "apply-methods-source-pg", "apply-methods-target-pg", "copy", "us-east-1");
+        assertEquals("pending-reboot", copy.getApplyMethods().get("max_connections"));
+        assertEquals("immediate", copy.getApplyMethods().get("work_mem"));
+
+        rdsService.resetDbParameterGroup(
+                "apply-methods-target-pg", false, List.of("max_connections"), "us-east-1");
+        DbParameterGroup partiallyReset = rdsService.getDbParameterGroup("apply-methods-target-pg");
+        assertFalse(partiallyReset.getParameters().containsKey("max_connections"));
+        assertFalse(partiallyReset.getApplyMethods().containsKey("max_connections"));
+        assertEquals("immediate", partiallyReset.getApplyMethods().get("work_mem"));
+
+        rdsService.resetDbParameterGroup(
+                "apply-methods-target-pg", true, List.of(), "us-east-1");
+        assertTrue(rdsService.getDbParameterGroup("apply-methods-target-pg").getApplyMethods().isEmpty());
+    }
+
+    @Test
+    void clusterParameterGroupApplyMethodsSurviveCopyAndDropOnReset() {
+        rdsService.createDbClusterParameterGroup("apply-methods-source-cpg", "aurora-postgresql16", "source");
+        rdsService.modifyDbClusterParameterGroup(
+                "apply-methods-source-cpg", Map.of("log_statement", "all"),
+                Map.of("log_statement", "pending-reboot"), "us-east-1");
+
+        DbClusterParameterGroup copy = rdsService.copyDbClusterParameterGroup(
+                "apply-methods-source-cpg", "apply-methods-target-cpg", "copy", "us-east-1");
+        assertEquals("pending-reboot", copy.getApplyMethods().get("log_statement"));
+
+        rdsService.resetDbClusterParameterGroup(
+                "apply-methods-target-cpg", true, List.of(), "us-east-1");
+        assertTrue(rdsService.getDbClusterParameterGroup("apply-methods-target-cpg").getApplyMethods().isEmpty());
+    }
+
+    @Test
+    void modifyDbClusterParameterGroupWithoutApplyMethodsLeavesTheStoredMethodsUnchanged() {
+        rdsService.createDbClusterParameterGroup("cpg-methods", "aurora-postgresql16", "desc");
+        rdsService.modifyDbClusterParameterGroup(
+                "cpg-methods", Map.of("log_statement", "all"),
+                Map.of("log_statement", "pending-reboot"), "us-east-1");
+        rdsService.modifyDbClusterParameterGroup("cpg-methods", Map.of("max_connections", "400"));
+
+        DbClusterParameterGroup group = rdsService.getDbClusterParameterGroup("cpg-methods");
+        assertEquals("pending-reboot", group.getApplyMethods().get("log_statement"));
+        assertFalse(group.getApplyMethods().containsKey("max_connections"));
+    }
+
+    @Test
     void modifyManagedDefaultClusterParameterGroupIsRejectedWithoutPersistingChanges() {
         String name = "default.aurora-postgresql16";
 

@@ -10,12 +10,14 @@ import org.junit.jupiter.api.TestMethodOrder;
 import static io.restassured.RestAssured.given;
 import static io.restassured.http.ContentType.URLENC;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.not;
 
 /**
  * The RDS model declares the {@code Parameters} list with {@code locationName: Parameter}, so the
- * CLI and every SDK send {@code Parameters.Parameter.N.*}. A modify sent that way must land in
- * the group; the plain {@code Parameters.member.N.*} encoding stays accepted for callers that
- * build the query by hand.
+ * CLI and every SDK send {@code Parameters.Parameter.N.*} and read {@code <Parameter>} rows back.
+ * A modify sent that way must land in the group, a describe must return each row with
+ * {@code Source} and {@code ApplyMethod}, and the plain {@code Parameters.member.N.*} encoding
+ * stays accepted for callers that build the query by hand.
  */
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -63,10 +65,12 @@ class RdsParameterGroupWireEncodingIntegrationTest {
         .when().post("/")
         .then()
             .statusCode(200)
-            .body(containsString("<ParameterName>max_connections</ParameterName>"))
-            .body(containsString("<ParameterValue>250</ParameterValue>"))
-            .body(containsString("<ParameterName>work_mem</ParameterName>"))
-            .body(containsString("<ParameterValue>65536</ParameterValue>"));
+            .body(containsString("<Parameter><ParameterName>max_connections</ParameterName>"
+                    + "<ParameterValue>250</ParameterValue><Source>user</Source><IsModifiable>true</IsModifiable>"
+                    + "<ApplyMethod>immediate</ApplyMethod></Parameter>"))
+            .body(containsString("<Parameter><ParameterName>work_mem</ParameterName>"
+                    + "<ParameterValue>65536</ParameterValue><Source>user</Source><IsModifiable>true</IsModifiable>"
+                    + "<ApplyMethod>pending-reboot</ApplyMethod></Parameter>"));
 
         // The plain Query encoding keeps working alongside it.
         query("ModifyDBParameterGroup")
@@ -81,7 +85,33 @@ class RdsParameterGroupWireEncodingIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("<ParameterName>shared_buffers</ParameterName>"))
-            .body(containsString("<ParameterName>max_connections</ParameterName>"));
+            .body(containsString("<ParameterName>max_connections</ParameterName>"))
+            .body(containsString("<Parameter><ParameterName>shared_buffers</ParameterName>"
+                    + "<ParameterValue>4096</ParameterValue><Source>user</Source><IsModifiable>true</IsModifiable>"
+                    + "<ApplyMethod>immediate</ApplyMethod></Parameter>"));
+    }
+
+    @Test
+    @Order(2)
+    void describeDbParametersAfterNoModifyLeaksNoSourceOrApplyMethod() {
+        String noParameterPg = "wire-encoding-empty-pg";
+        query("CreateDBParameterGroup")
+                .formParam("DBParameterGroupName", noParameterPg)
+                .formParam("DBParameterGroupFamily", "postgres15")
+                .formParam("Description", "no modify yet")
+        .when().post("/").then().statusCode(200);
+
+        query("DescribeDBParameters")
+                .formParam("DBParameterGroupName", noParameterPg)
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<ParameterName>")))
+            .body(not(containsString("<Source>")))
+            .body(not(containsString("<ApplyMethod>")));
+
+        query("DeleteDBParameterGroup").formParam("DBParameterGroupName", noParameterPg)
+        .when().post("/").then().statusCode(200);
     }
 
     @Test
@@ -109,7 +139,41 @@ class RdsParameterGroupWireEncodingIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("<ParameterName>rds.force_ssl</ParameterName>"))
-            .body(containsString("<ParameterValue>1</ParameterValue>"));
+            .body(containsString("<ParameterValue>1</ParameterValue>"))
+            .body(containsString("<Parameter><ParameterName>rds.force_ssl</ParameterName>"
+                    + "<ParameterValue>1</ParameterValue><Source>user</Source><IsModifiable>true</IsModifiable>"
+                    + "<ApplyMethod>immediate</ApplyMethod></Parameter>"));
+    }
+
+    @Test
+    @Order(3)
+    void describeDbParametersReturnsRowsForUserAndNothingForEngineDefaults() {
+        query("DescribeDBParameters")
+                .formParam("DBParameterGroupName", PG)
+                .formParam("Source", "user")
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Parameter><ParameterName>max_connections</ParameterName>"
+                    + "<ParameterValue>250</ParameterValue><Source>user</Source><IsModifiable>true</IsModifiable>"
+                    + "<ApplyMethod>immediate</ApplyMethod></Parameter>"));
+
+        query("DescribeDBParameters")
+                .formParam("DBParameterGroupName", PG)
+                .formParam("Source", "engine-default")
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<ParameterName>")))
+            .body(not(containsString("<Source>")));
+
+        query("DescribeDBClusterParameters")
+                .formParam("DBClusterParameterGroupName", CLUSTER_PG)
+                .formParam("Source", "engine-default")
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<ParameterName>")));
     }
 
     @Test

@@ -1543,8 +1543,9 @@ public class RdsQueryHandler {
             return AwsQueryResponse.error("InvalidParameterValue", "DBParameterGroupName is required.", AwsNamespaces.RDS, 400);
         }
         Map<String, String> parameters = parseParameterOverrides(params);
+        Map<String, String> applyMethods = parseParametersApplyMethods(params);
         try {
-            DbParameterGroup group = service.modifyDbParameterGroup(name, parameters, region);
+            DbParameterGroup group = service.modifyDbParameterGroup(name, parameters, applyMethods, region);
             String result = new XmlBuilder()
                     .elem("DBParameterGroupName", group.getDbParameterGroupName())
                     .build();
@@ -1575,6 +1576,30 @@ public class RdsQueryHandler {
             }
         }
         return parameters;
+    }
+
+    /**
+     * Parses the {@code ApplyMethod} sent with each member of a modify request's {@code Parameters}
+     * list, defaulting to {@code immediate} for callers that omit it. As in
+     * {@link #parseParameterOverrides}, a member without a {@code ParameterValue} is skipped.
+     */
+    private static Map<String, String> parseParametersApplyMethods(MultivaluedMap<String, String> params) {
+        Map<String, String> applyMethods = new LinkedHashMap<>();
+        for (String prefix : List.of("Parameters.Parameter", "Parameters.member")) {
+            for (int n = 1; ; n++) {
+                String paramName = params.getFirst(prefix + "." + n + ".ParameterName");
+                if (paramName == null) {
+                    break;
+                }
+                String paramValue = params.getFirst(prefix + "." + n + ".ParameterValue");
+                if (paramValue == null) {
+                    continue;
+                }
+                String applyMethod = params.getFirst(prefix + "." + n + ".ApplyMethod");
+                applyMethods.put(paramName, applyMethod == null ? "immediate" : applyMethod);
+            }
+        }
+        return applyMethods;
     }
 
     private Response handleCopyDbParameterGroup(
@@ -1635,6 +1660,11 @@ public class RdsQueryHandler {
         return names;
     }
 
+    /** Floci models no system parameters: a describe of those sources lists nothing. */
+    private static boolean requestsUnmodeledSource(String source) {
+        return "system".equals(source) || "engine-default".equals(source);
+    }
+
     private Response handleDescribeDbParameters(
             MultivaluedMap<String, String> params, String region) {
         String name = params.getFirst("DBParameterGroupName");
@@ -1644,12 +1674,16 @@ public class RdsQueryHandler {
         try {
             DbParameterGroup group = service.getDbParameterGroup(name, region);
             XmlBuilder xml = new XmlBuilder().start("Parameters");
-            for (Map.Entry<String, String> entry : group.getParameters().entrySet()) {
-                xml.start("member")
-                   .elem("ParameterName", entry.getKey())
-                   .elem("ParameterValue", entry.getValue())
-                   .elem("IsModifiable", true)
-                   .end("member");
+            if (!requestsUnmodeledSource(params.getFirst("Source"))) {
+                for (Map.Entry<String, String> entry : group.getParameters().entrySet()) {
+                    xml.start("Parameter")
+                       .elem("ParameterName", entry.getKey())
+                       .elem("ParameterValue", entry.getValue())
+                       .elem("Source", "user")
+                       .elem("IsModifiable", true)
+                       .elem("ApplyMethod", group.getApplyMethods().getOrDefault(entry.getKey(), "immediate"))
+                       .end("Parameter");
+                }
             }
             xml.end("Parameters").start("Marker").end("Marker");
             return Response.ok(AwsQueryResponse.envelope("DescribeDBParameters", AwsNamespaces.RDS, xml.build())).build();
@@ -1720,9 +1754,10 @@ public class RdsQueryHandler {
             return AwsQueryResponse.error("InvalidParameterValue", "DBClusterParameterGroupName is required.", AwsNamespaces.RDS, 400);
         }
         Map<String, String> parameters = parseParameterOverrides(params);
+        Map<String, String> applyMethods = parseParametersApplyMethods(params);
         try {
             DbClusterParameterGroup group = service.modifyDbClusterParameterGroup(
-                    name, parameters, region);
+                    name, parameters, applyMethods, region);
             String result = new XmlBuilder()
                     .elem("DBClusterParameterGroupName", group.getDbClusterParameterGroupName())
                     .build();
@@ -1784,12 +1819,16 @@ public class RdsQueryHandler {
         try {
             DbClusterParameterGroup group = service.getDbClusterParameterGroup(name, region);
             XmlBuilder xml = new XmlBuilder().start("Parameters");
-            for (Map.Entry<String, String> entry : group.getParameters().entrySet()) {
-                xml.start("member")
-                   .elem("ParameterName", entry.getKey())
-                   .elem("ParameterValue", entry.getValue())
-                   .elem("IsModifiable", true)
-                   .end("member");
+            if (!requestsUnmodeledSource(params.getFirst("Source"))) {
+                for (Map.Entry<String, String> entry : group.getParameters().entrySet()) {
+                    xml.start("Parameter")
+                       .elem("ParameterName", entry.getKey())
+                       .elem("ParameterValue", entry.getValue())
+                       .elem("Source", "user")
+                       .elem("IsModifiable", true)
+                       .elem("ApplyMethod", group.getApplyMethods().getOrDefault(entry.getKey(), "immediate"))
+                       .end("Parameter");
+                }
             }
             xml.end("Parameters").start("Marker").end("Marker");
             return Response.ok(AwsQueryResponse.envelope("DescribeDBClusterParameters", AwsNamespaces.RDS, xml.build())).build();
