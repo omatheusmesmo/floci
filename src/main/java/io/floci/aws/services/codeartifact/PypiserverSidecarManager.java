@@ -132,9 +132,16 @@ public class PypiserverSidecarManager implements ContainerTeardown {
                         // pypiserver's own default server selection ("auto") lands on a
                         // single-threaded synchronous fallback that cannot reliably receive a
                         // real multi-GB publish body, discovered by hand-testing one end to end
-                        // (the connection was dropped mid-upload); gevent is already present in
-                        // the pinned image and handles a large body correctly.
-                        "--server", "gevent",
+                        // (the connection was dropped mid-upload). The pinned image's plain
+                        // "gevent" server (one bare gevent.pywsgi process) took that job but
+                        // wedges silently under concurrent first requests against a fresh
+                        // repository: every connection after the health probe hangs for the
+                        // client's whole timeout, even ones sent from inside the container,
+                        // and the process stays up at 0% CPU serving nothing (issue #9138).
+                        // "gunicorn" runs the same gevent WSGI handler behind gunicorn's own
+                        // master process, which serves concurrent first use and multi-GB
+                        // bodies alike; gunicorn is already present in the pinned image.
+                        "--server", "gunicorn",
                         PACKAGES_DIR))
                 .build();
         String containerId = lifecycleManager.create(spec);
